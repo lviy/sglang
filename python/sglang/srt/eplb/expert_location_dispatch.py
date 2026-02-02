@@ -16,10 +16,11 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
+import logging
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.server_args import get_global_server_args
-
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ExpertLocationDispatchInfo:
@@ -77,6 +78,7 @@ def topk_ids_logical_to_physical(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
     if info is None:
+        #logger.info("none!!")
         return topk_ids
 
     if info.ep_dispatch_algorithm == "static":
@@ -89,6 +91,7 @@ def topk_ids_logical_to_physical(
 def _topk_ids_logical_to_physical_static(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
+    #logger.info("logical!!")
     return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
 
 
@@ -98,7 +101,7 @@ def _topk_ids_logical_to_physical_dynamic(
     topk_ids_original_shape = topk_ids.shape
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
-
+    #logger.info("dynamic!!")
     chosen_dispatch_index = (
         torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
         % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
