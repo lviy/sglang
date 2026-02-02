@@ -2186,7 +2186,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def __str__(self):
         return (
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
-            f"#req={(len(self.reqs))})"
+            f"#req={(len(self.reqs))}), "
+            f"#out_cache_loc={self.out_cache_loc})"
         )
 
 

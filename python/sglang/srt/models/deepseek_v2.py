@@ -159,6 +159,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -434,6 +435,8 @@ def handle_attention_nsa(attn, forward_batch):
     backend = forward_batch.attn_backend
     if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
         backend = backend.primary
+    if isinstance(backend, HybridAttnBackend):
+        backend = backend._select_backend(forward_batch.forward_mode)
     if hasattr(backend, "use_mha") and backend.use_mha:
         return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
@@ -813,6 +816,7 @@ class DeepseekV2MoE(nn.Module):
             else:
                 return self.forward_normal(
                     hidden_states,
+                    forward_batch,
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
@@ -856,6 +860,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
@@ -874,7 +879,14 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -2704,7 +2716,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         ):
             k = k_nope.new_empty(*k_shape)
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        elif _is_cuda:
+        elif _is_cuda and all(
+            # (i.bit_count() == 1) == (is_power_of_two(i))
+            i.bit_count() == 1
+            for i in (k_shape[1], k_nope.shape[-1], k_pe.shape[-1])
+        ):
             # fa3 mha support fp8 inputs
             if (
                 self.current_attention_backend == "fa3"
