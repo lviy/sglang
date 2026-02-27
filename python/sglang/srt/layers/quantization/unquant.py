@@ -401,6 +401,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     w2_weight=layer.w2_weight,
                     b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
+                    w13_ptr_table=getattr(layer, "w1_ptr_table", None),
+                    w2_ptr_table=getattr(layer, "w2_ptr_table", None),
                 )
                 return self.runner.run(dispatch_output, quant_info)
 

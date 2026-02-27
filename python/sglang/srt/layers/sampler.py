@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -49,13 +50,19 @@ class Sampler(nn.Module):
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
     ) -> torch.Tensor:
         """Apply custom logit processors and handle NaN detection."""
+        maybe_log_tensor_stats("sampler_logits_entry", logits, logger)
+
         # Apply the custom logit processors if registered in the sampling info
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
+            maybe_log_tensor_stats(
+                "sampler_logits_post_custom_processor", logits, logger
+            )
 
         # Detect and handle NaN values in logits
         if self.use_nan_detection and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
+            maybe_log_tensor_stats("sampler_nan_detected", logits, logger)
             logits = torch.where(
                 torch.isnan(logits), torch.full_like(logits, -1e5), logits
             )

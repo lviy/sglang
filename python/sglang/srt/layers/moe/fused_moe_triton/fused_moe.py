@@ -8,12 +8,14 @@ from __future__ import annotations
 import functools
 import os
 from typing import TYPE_CHECKING, List, Optional
+#from sglang.utils import logger
 
 import torch
 import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -87,6 +89,8 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    w1_ptr_table: Optional[torch.Tensor] = None,
+    w2_ptr_table: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -117,6 +121,8 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        w1_ptr_table,
+        w2_ptr_table,
     )
 
 
@@ -149,6 +155,8 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    w1_ptr_table: Optional[torch.Tensor] = None,
+    w2_ptr_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -179,6 +187,8 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        w1_ptr_table=w1_ptr_table,
+        w2_ptr_table=w2_ptr_table,
     )
 
 
@@ -202,7 +212,9 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
-):
+    w1_ptr_table: Optional[torch.Tensor] = None,
+    w2_ptr_table: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
         moe_runner_config.num_experts is None
@@ -237,6 +249,8 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            w1_ptr_table=w1_ptr_table,
+            w2_ptr_table=w2_ptr_table,
         )
         return hidden_states
     else:
@@ -268,6 +282,8 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            w1_ptr_table=w1_ptr_table,
+            w2_ptr_table=w2_ptr_table,
         )
 
 
@@ -319,6 +335,8 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    w1_ptr_table: Optional[torch.Tensor] = None,
+    w2_ptr_table: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -339,6 +357,35 @@ def fused_experts_impl(
 
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
+    
+    if w1_ptr_table is not None:
+        w1_ptr_tensor = w1_ptr_table
+        w2_ptr_tensor = w2_ptr_table
+    else:
+        # === [Modification Start] 制作间接寻址指针 Tensor ===
+        # 目的：我们不再直接传 w1，而是传 w1 每一层专家的显存地址数组。
+        # 这样以后即使 w1 的物理显存不连续（比如专家在不同 GPU 显存页上），只要更新这个指针数组即可。
+        
+        # 获取 w1 和 w2 的每个专家的物理地址
+        # 这里的 stride(0) 是指第 0 维（专家维）跨越的元素个数，乘以 element_size() 得到字节偏移
+        w1_base = w1.data_ptr()
+        w1_stride_bytes = w1.stride(0) * w1.element_size() 
+        
+        w2_base = w2.data_ptr()
+        w2_stride_bytes = w2.stride(0) * w2.element_size()
+
+        # 创建 [0, 1, 2, ... E-1] 的索引
+        expert_indices = torch.arange(E, device=hidden_states.device, dtype=torch.int64)
+
+        # 计算地址： ptr[i] = base + i * stride
+        # 这就是一个 Shape 为 [E] 的 int64 Tensor，里面存的是物理地址
+        w1_ptr_tensor = w1_base + expert_indices * w1_stride_bytes # ptr[exp_id]
+        w2_ptr_tensor = w2_base + expert_indices * w2_stride_bytes
+
+    w1_stride_n = w1.stride(1)
+    w1_stride_k = w1.stride(2)
+    w2_stride_n = w2.stride(1)
+    w2_stride_k = w2.stride(2)
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
     CHUNK_SIZE = 64 * 1024
@@ -444,7 +491,7 @@ def fused_experts_impl(
 
         invoke_fused_moe_kernel(
             curr_hidden_states,
-            w1,
+            w1_ptr_tensor,
             b1,
             intermediate_cache1,
             a1_scale,
@@ -467,6 +514,10 @@ def fused_experts_impl(
             block_shape=block_shape,
             c_sorted=down_moe_use_tma,
             filter_expert=filter_expert,
+            B_N=w1.shape[1],  # 显式传入 N
+            B_K=w1.shape[2], # 显式传入 K
+            stride_bn_override=w1_stride_n,
+            stride_bk_override=w1_stride_k
         )
 
         # Activation function with multiplication
@@ -527,7 +578,7 @@ def fused_experts_impl(
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
-            w2,
+            w2_ptr_tensor,
             b2,
             (
                 intermediate_cache3
@@ -555,6 +606,10 @@ def fused_experts_impl(
             a_use_tma=down_moe_use_tma,
             b_use_tma=down_moe_use_tma,
             filter_expert=filter_expert,
+            B_N=w2.shape[1],
+            B_K=w2.shape[2],
+            stride_bn_override=w2_stride_n,
+            stride_bk_override=w2_stride_k
         )
 
         if routed_scaling_factor is None:
@@ -573,7 +628,10 @@ def fused_experts_impl(
                 ).squeeze(dim=1)
             else:
                 # According to micro benchmark results, torch.compile can get better performance for small token.
-                if tokens_in_chunk <= 32:
+                if (
+                    not get_global_server_args().enable_deterministic_inference
+                    and tokens_in_chunk <= 32
+                ):
                     moe_sum_reduce_torch_compile(
                         intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],

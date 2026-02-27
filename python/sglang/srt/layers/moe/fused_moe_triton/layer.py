@@ -290,6 +290,16 @@ class FusedMoE(torch.nn.Module):
             with_bias=with_bias,
         )
 
+        # Persistent pointer tables for indirect addressing (supports CUDA Graph & Offloading)
+        # Initialize with contiguous mapping by default
+        self.w1_ptr_table = torch.empty(
+            self.num_local_experts, dtype=torch.int64, device=server_args.device
+        )
+        self.w2_ptr_table = torch.empty(
+            self.num_local_experts, dtype=torch.int64, device=server_args.device
+        )
+        self.update_expert_mapping_to_contiguous()
+
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
@@ -308,6 +318,36 @@ class FusedMoE(torch.nn.Module):
 
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
+
+    def update_expert_mapping(self, physical_expert_id: int, w1_ptr: int, w2_ptr: int):
+        """Update the pointer mapping for a specific physical expert slot."""
+        if physical_expert_id < 0 or physical_expert_id >= self.num_local_experts:
+            raise ValueError(f"Invalid physical_expert_id: {physical_expert_id}")
+        self.w1_ptr_table[physical_expert_id] = w1_ptr
+        self.w2_ptr_table[physical_expert_id] = w2_ptr
+
+    def update_expert_mapping_to_contiguous(self):
+        """Reset the pointer tables to point to the current contiguous weights."""
+        if self.num_local_experts == 0:
+            return
+
+        # w1 (w13)
+        if hasattr(self, "w13_weight"):
+            w1_base = self.w13_weight.data_ptr()
+            w1_stride = self.w13_weight.stride(0) * self.w13_weight.element_size()
+            expert_indices = torch.arange(
+                self.num_local_experts, device=self.w13_weight.device, dtype=torch.int64
+            )
+            self.w1_ptr_table.copy_(w1_base + expert_indices * w1_stride)
+
+        # w2
+        if hasattr(self, "w2_weight"):
+            w2_base = self.w2_weight.data_ptr()
+            w2_stride = self.w2_weight.stride(0) * self.w2_weight.element_size()
+            expert_indices = torch.arange(
+                self.num_local_experts, device=self.w2_weight.device, dtype=torch.int64
+            )
+            self.w2_ptr_table.copy_(w2_base + expert_indices * w2_stride)
 
     def _load_per_tensor_weight_scale(
         self,

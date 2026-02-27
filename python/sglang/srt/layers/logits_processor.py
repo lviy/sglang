@@ -22,6 +22,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -868,6 +869,16 @@ class LogitsProcessor(nn.Module):
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
+        maybe_log_tensor_stats(
+            "logits_hidden_states_pre_lm_head",
+            hidden_states,
+            logger,
+            extra={
+                "use_attn_tp_group": self.use_attn_tp_group,
+                "dp_lm_head": get_global_server_args().enable_dp_lm_head,
+            },
+        )
+
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
@@ -908,6 +919,13 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        maybe_log_tensor_stats(
+            "logits_post_lm_head_matmul_local",
+            logits,
+            logger,
+            extra={"use_attn_tp_group": self.use_attn_tp_group},
+        )
+
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 if self.config.vocab_size % self.attn_tp_size == 0:
@@ -936,8 +954,19 @@ class LogitsProcessor(nn.Module):
                         logits,
                     )
                 logits = global_logits
+                maybe_log_tensor_stats(
+                    "logits_post_attn_tp_all_gather",
+                    logits,
+                    logger,
+                    extra={"attn_tp_size": self.attn_tp_size},
+                )
             else:
                 logits = tensor_model_parallel_all_gather(logits)
+                maybe_log_tensor_stats(
+                    "logits_post_tensor_parallel_all_gather",
+                    logits,
+                    logger,
+                )
 
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits, global_logits = (
@@ -949,6 +978,12 @@ class LogitsProcessor(nn.Module):
                 logits,
             )
             dp_scatter(logits, global_logits, logits_metadata)
+            maybe_log_tensor_stats(
+                "logits_post_dp_scatter",
+                logits,
+                logger,
+                extra={"dp_scatter": True},
+            )
 
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer

@@ -609,6 +609,29 @@ class DeepseekV2WeightLoaderMixin:
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
+            # Initialize FusedMoE expert mapping table
+            layer = (
+                self.model.layers[layer_id]
+                if not is_nextn
+                else self.model.decoder
+            )
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                experts = layer.mlp.experts
+                if isinstance(experts, FusedMoE):
+                    # Ensure w13_weight and w2_weight are available
+                    if (
+                        hasattr(experts, "w13_weight")
+                        and experts.w13_weight is not None
+                        and hasattr(experts, "w2_weight")
+                        and experts.w2_weight is not None
+                    ):
+                        for i in range(
+                            min(experts.num_local_experts, experts.w13_weight.shape[0])
+                        ):
+                            w1_ptr = experts.w13_weight[i].data_ptr()
+                            w2_ptr = experts.w2_weight[i].data_ptr()
+                            experts.update_expert_mapping(i, w1_ptr, w2_ptr)
+
     def _maybe_quant_weights_to_fp8_ue8m0(
         self,
         weights,

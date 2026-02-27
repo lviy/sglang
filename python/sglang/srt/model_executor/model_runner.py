@@ -45,6 +45,7 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
@@ -2371,9 +2372,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
+        maybe_log_tensor_stats(
+            "next_token_logits_pre_bias",
+            logits_output.next_token_logits,
+            logger,
+        )
+
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+        maybe_log_tensor_stats(
+            "next_token_logits_post_bias",
+            logits_output.next_token_logits,
+            logger,
+        )
 
     def sample(
         self,

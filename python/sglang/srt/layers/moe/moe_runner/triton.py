@@ -101,6 +101,8 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     a13_scale: Optional[torch.Tensor] = None
     a2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    w13_ptr_table: Optional[torch.Tensor] = None
+    w2_ptr_table: Optional[torch.Tensor] = None
 
 
 class TritonRunnerCore(MoeRunnerCore):
@@ -169,9 +171,17 @@ class TritonRunnerCore(MoeRunnerCore):
             dtype=hidden_states.dtype,
         )
 
+        if quant_info.w13_ptr_table is not None:
+            w13_B = quant_info.w13_ptr_table
+        else:
+            w13_base = w13.data_ptr()
+            w13_stride = w13.stride(0) * w13.element_size()
+            indices = torch.arange(E, device=hidden_states.device, dtype=torch.int64)
+            w13_B = w13_base + indices * w13_stride
+
         invoke_fused_moe_kernel(
             hidden_states,
-            w13,
+            w13_B,
             b13,
             intermediate_cache1,
             a13_scale,
@@ -192,6 +202,10 @@ class TritonRunnerCore(MoeRunnerCore):
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            B_N=w13.shape[1],
+            B_K=w13.shape[2],
+            stride_bn_override=w13.stride(1),
+            stride_bk_override=w13.stride(2),
         )
 
         intermediate_cache2 = torch.empty(
@@ -244,9 +258,17 @@ class TritonRunnerCore(MoeRunnerCore):
         else:
             out_hidden_states = torch.empty_like(hidden_states)
 
+        if quant_info.w2_ptr_table is not None:
+            w2_B = quant_info.w2_ptr_table
+        else:
+            w2_base = w2.data_ptr()
+            w2_stride = w2.stride(0) * w2.element_size()
+            indices = torch.arange(E, device=hidden_states.device, dtype=torch.int64)
+            w2_B = w2_base + indices * w2_stride
+
         invoke_fused_moe_kernel(
             intermediate_cache2,
-            w2,
+            w2_B,
             b2,
             (
                 intermediate_cache3
@@ -271,6 +293,10 @@ class TritonRunnerCore(MoeRunnerCore):
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            B_N=w2.shape[1],
+            B_K=w2.shape[2],
+            stride_bn_override=w2.stride(1),
+            stride_bk_override=w2.stride(2),
         )
 
         if routed_scaling_factor is None:
