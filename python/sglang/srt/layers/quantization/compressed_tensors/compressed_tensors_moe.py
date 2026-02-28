@@ -84,16 +84,24 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
+_FLASHINFER_MXINT4_AVAILABLE = False
+_FLASHINFER_MXINT4_IMPORT_ERROR: Exception | None = None
+
 if is_flashinfer_available():
     from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import (
-        convert_to_block_layout,
-        trtllm_mxint4_block_scale_moe,
-    )
+    from flashinfer.fused_moe import convert_to_block_layout
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
+
+    try:
+        from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
+
+        _FLASHINFER_MXINT4_AVAILABLE = True
+    except ImportError as e:
+        trtllm_mxint4_block_scale_moe = None
+        _FLASHINFER_MXINT4_IMPORT_ERROR = e
 
 
 logger = logging.getLogger(__name__)
@@ -1815,6 +1823,13 @@ class CompressedTensorsMxInt4MoEMethod(CompressedTensorsMoEMethod):
         assert (
             get_moe_runner_backend().is_flashinfer_trtllm()
         ), "MxInt4 only supports flashinfer_trtllm backend"
+        if not _FLASHINFER_MXINT4_AVAILABLE:
+            raise ImportError(
+                "flashinfer is missing `trtllm_mxint4_block_scale_moe`, but this "
+                "SGLang path requires it for CompressedTensorsMxInt4MoEMethod. "
+                "Please upgrade flashinfer to a compatible version or avoid mxint4 "
+                "compressed-tensors quantization."
+            ) from _FLASHINFER_MXINT4_IMPORT_ERROR
         assert (
             not config.actorder
         ), "Actorder is not supported by flashinfer_trtllm backend"
