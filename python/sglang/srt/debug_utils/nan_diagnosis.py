@@ -69,6 +69,15 @@ def _is_rank_enabled() -> bool:
     return _get_rank() in _RANK_FILTER
 
 
+def _is_stream_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.is_current_stream_capturing()
+    except Exception:
+        return False
+
+
 def _next_stage_call_index(stage: str) -> int:
     call_index = _STAGE_CALL_COUNTER.get(stage, 0) + 1
     _STAGE_CALL_COUNTER[stage] = call_index
@@ -198,6 +207,9 @@ def maybe_log_tensor_stats(
     global _GLOBAL_LOG_COUNT
 
     if not _ENABLED or tensor is None or not isinstance(tensor, torch.Tensor):
+        return False
+    # CUDA graph capture forbids host sync paths like .item() used by stats.
+    if _is_stream_capturing():
         return False
     if not _is_rank_enabled():
         return False
