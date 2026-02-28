@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_event, maybe_log_invariant
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -77,6 +78,29 @@ class ChunkCache(BasePrefixCache):
         ]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        maybe_log_event(
+            "chunk_cache_unfinished_req",
+            logger,
+            extra={
+                "rid": req.rid,
+                "req_pool_idx": req.req_pool_idx,
+                "fill_len": len(req.fill_ids),
+                "prefix_len": len(req.prefix_indices),
+                "chunked": chunked,
+            },
+        )
+        maybe_log_invariant(
+            "chunk_cache_prefix_fill_len_mismatch",
+            len(req.prefix_indices) == len(req.fill_ids),
+            logger,
+            extra={
+                "rid": req.rid,
+                "req_pool_idx": req.req_pool_idx,
+                "fill_len": len(req.fill_ids),
+                "prefix_len": len(req.prefix_indices),
+                "chunked": chunked,
+            },
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

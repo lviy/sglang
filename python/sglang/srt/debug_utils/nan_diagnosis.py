@@ -69,6 +69,66 @@ def _is_rank_enabled() -> bool:
     return _get_rank() in _RANK_FILTER
 
 
+def _next_stage_call_index(stage: str) -> int:
+    call_index = _STAGE_CALL_COUNTER.get(stage, 0) + 1
+    _STAGE_CALL_COUNTER[stage] = call_index
+    return call_index
+
+
+def maybe_log_event(
+    stage: str,
+    logger: logging.Logger,
+    extra: Optional[Dict[str, object]] = None,
+    force: bool = False,
+) -> bool:
+    """Log a structured checkpoint event for flow debugging.
+
+    The event is active only when NaN diagnosis is enabled and rank filter matches.
+    """
+    global _GLOBAL_LOG_COUNT
+
+    if not _ENABLED or not _is_rank_enabled():
+        return False
+
+    call_index = _next_stage_call_index(stage)
+    if not force:
+        if not _LOG_ALL:
+            return False
+        if call_index % _LOG_EVERY != 0:
+            return False
+        if _GLOBAL_LOG_COUNT >= _MAX_LOGS:
+            return False
+
+    info = {
+        "stage": stage,
+        "rank": _get_rank(),
+        "call_index": call_index,
+    }
+    if extra:
+        info.update(extra)
+
+    if force:
+        logger.warning("NaNDiag checkpoint: %s", info)
+    else:
+        logger.info("NaNDiag checkpoint: %s", info)
+
+    _GLOBAL_LOG_COUNT += 1
+    return True
+
+
+def maybe_log_invariant(
+    stage: str,
+    ok: bool,
+    logger: logging.Logger,
+    extra: Optional[Dict[str, object]] = None,
+) -> bool:
+    """Log an invariant failure as a high-priority checkpoint."""
+    if ok:
+        return True
+    maybe_log_event(stage, logger, extra=extra, force=True)
+    return False
+
+
 def _tensor_stats(tensor: torch.Tensor) -> Dict[str, object]:
     data = tensor.detach()
     isnan = torch.isnan(data).any().item()
@@ -142,8 +202,7 @@ def maybe_log_tensor_stats(
     if not _is_rank_enabled():
         return False
 
-    call_index = _STAGE_CALL_COUNTER.get(stage, 0) + 1
-    _STAGE_CALL_COUNTER[stage] = call_index
+    call_index = _next_stage_call_index(stage)
 
     stats = _tensor_stats(tensor)
     has_non_finite = stats["isnan"] or stats["isinf"]

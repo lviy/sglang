@@ -35,6 +35,7 @@ from torch.distributed import barrier
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_event, maybe_log_invariant
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -1795,7 +1796,36 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        pre_prefix_len = len(req.prefix_indices)
+        pre_fill_len = len(req.fill_ids)
+        pre_req_pool_idx = req.req_pool_idx
         self.tree_cache.cache_unfinished_req(req, chunked=True)
+        post_prefix_len = len(req.prefix_indices)
+        maybe_log_event(
+            "stash_chunked_request",
+            logger,
+            extra={
+                "rid": req.rid,
+                "pre_prefix_len": pre_prefix_len,
+                "pre_fill_len": pre_fill_len,
+                "post_prefix_len": post_prefix_len,
+                "cache_protected_len": req.cache_protected_len,
+                "req_pool_idx": pre_req_pool_idx,
+                "chunk_cache": self.tree_cache.is_chunk_cache(),
+            },
+        )
+        maybe_log_invariant(
+            "stash_chunked_request_prefix_overflow",
+            post_prefix_len <= pre_fill_len,
+            logger,
+            extra={
+                "rid": req.rid,
+                "pre_fill_len": pre_fill_len,
+                "post_prefix_len": post_prefix_len,
+                "req_pool_idx": pre_req_pool_idx,
+                "chunk_cache": self.tree_cache.is_chunk_cache(),
+            },
+        )
         # Chunked request keeps its rid but will get a new req_pool_idx
         if self.tp_worker.model_runner.mambaish_config is not None:
             self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=False)

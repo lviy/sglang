@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_event, maybe_log_invariant
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
@@ -905,6 +906,33 @@ class Req:
             )
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+        prefix_len = len(self.prefix_indices)
+        extend_len = self.extend_input_len
+        fill_len = len(self.fill_ids)
+        maybe_log_event(
+            "req_init_next_round_input",
+            logger,
+            extra={
+                "rid": self.rid,
+                "prefix_len": prefix_len,
+                "extend_len": extend_len,
+                "fill_len": fill_len,
+                "cache_protected_len": self.cache_protected_len,
+                "is_retracted": self.is_retracted,
+            },
+        )
+        maybe_log_invariant(
+            "req_init_next_round_input_len_mismatch",
+            prefix_len + extend_len == fill_len,
+            logger,
+            extra={
+                "rid": self.rid,
+                "prefix_len": prefix_len,
+                "extend_len": extend_len,
+                "fill_len": fill_len,
+                "cache_protected_len": self.cache_protected_len,
+            },
+        )
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):

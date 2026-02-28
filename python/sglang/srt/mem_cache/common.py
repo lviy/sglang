@@ -7,6 +7,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.debug_utils.nan_diagnosis import (
+    maybe_log_event,
+    maybe_log_invariant,
+    maybe_log_tensor_stats,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -344,6 +349,21 @@ def alloc_for_extend(
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    prefix_lens_host = batch.prefix_lens
+    extend_lens_host = batch.extend_lens
+    maybe_log_event(
+        "alloc_for_extend_entry",
+        logger,
+        extra={
+            "bs": bs,
+            "page_size": batch.tree_cache.page_size,
+            "prefix_min": min(prefix_lens_host) if prefix_lens_host else 0,
+            "prefix_max": max(prefix_lens_host) if prefix_lens_host else 0,
+            "extend_min": min(extend_lens_host) if extend_lens_host else 0,
+            "extend_max": max(extend_lens_host) if extend_lens_host else 0,
+            "chunk_cache": batch.tree_cache.is_chunk_cache(),
+        },
+    )
 
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
@@ -367,13 +387,24 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
+        last_loc_tensor = torch.cat(last_loc)
+        maybe_log_tensor_stats(
+            "alloc_for_extend_last_loc",
+            last_loc_tensor,
+            logger,
+            extra={
+                "bs": bs,
+                "page_size": batch.tree_cache.page_size,
+                "empty_prefix_count": sum(1 for t in prefix_tensors if len(t) == 0),
+            },
+        )
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
             prefix_lens_cpu=prefix_lens_cpu,
             seq_lens=batch.seq_lens,
             seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
+            last_loc=last_loc_tensor,
             extend_num_tokens=batch.extend_num_tokens,
         )
 
@@ -390,6 +421,26 @@ def alloc_for_extend(
         extend_lens_cpu,
         prefix_tensors,
         batch.req_to_token_pool,
+    )
+
+    maybe_log_invariant(
+        "alloc_for_extend_out_cache_size_mismatch",
+        int(out_cache_loc.shape[0]) == int(extend_lens_cpu.sum().item()),
+        logger,
+        extra={
+            "out_cache_len": int(out_cache_loc.shape[0]),
+            "sum_extend_len": int(extend_lens_cpu.sum().item()),
+            "bs": bs,
+        },
+    )
+    maybe_log_event(
+        "alloc_for_extend_exit",
+        logger,
+        extra={
+            "bs": bs,
+            "out_cache_len": int(out_cache_loc.shape[0]),
+            "sum_extend_len": int(extend_lens_cpu.sum().item()),
+        },
     )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
