@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_tensor_model_parallel_rank,
@@ -440,6 +441,55 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+def _diag_safe_scalar(t: Optional[torch.Tensor]) -> Optional[int]:
+    if t is None:
+        return None
+    if not isinstance(t, torch.Tensor):
+        try:
+            return int(t)
+        except Exception:
+            return None
+    if t.numel() != 1:
+        return None
+    if t.is_cuda:
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+        except Exception:
+            return None
+    try:
+        return int(t.item())
+    except Exception:
+        return None
+
+
+def _dp_diag_extra(
+    forward_batch: ForwardBatch,
+    *,
+    is_partial: bool,
+    path: str,
+    local_start_pos: Optional[torch.Tensor] = None,
+    local_num_tokens: Optional[torch.Tensor] = None,
+) -> dict:
+    return {
+        "forward_mode": int(forward_batch.forward_mode),
+        "dp_padding_mode": str(forward_batch.dp_padding_mode),
+        "is_partial": bool(is_partial),
+        "path": path,
+        "attn_tp_rank": get_attention_tp_rank(),
+        "attn_tp_size": get_attention_tp_size(),
+        "attn_dp_rank": get_attention_dp_rank(),
+        "attn_dp_size": get_attention_dp_size(),
+        "tp_rank": get_tensor_model_parallel_rank(),
+        "tp_size": get_tensor_model_parallel_world_size(),
+        "local_start_pos": _diag_safe_scalar(local_start_pos),
+        "local_num_tokens": _diag_safe_scalar(local_num_tokens),
+        "local_tokens_rows": int(local_num_tokens.shape[0])
+        if isinstance(local_num_tokens, torch.Tensor) and local_num_tokens.dim() > 0
+        else None,
+    }
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -447,6 +497,19 @@ def _dp_gather_via_all_reduce(
     is_partial: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    base_extra = _dp_diag_extra(
+        forward_batch,
+        is_partial=is_partial,
+        path="all_reduce",
+        local_start_pos=local_start_pos,
+        local_num_tokens=local_num_tokens,
+    )
+    maybe_log_tensor_stats(
+        "dp_gather_allreduce_entry_local",
+        local_tokens,
+        logger,
+        extra=base_extra,
+    )
 
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
@@ -460,6 +523,12 @@ def _dp_gather_via_all_reduce(
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
+    maybe_log_tensor_stats(
+        "dp_gather_allreduce_after_copy_global",
+        global_tokens,
+        logger,
+        extra=base_extra,
+    )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -473,6 +542,12 @@ def _dp_gather_via_all_reduce(
 
     else:
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+    maybe_log_tensor_stats(
+        "dp_gather_allreduce_after_collective_global",
+        global_tokens,
+        logger,
+        extra=base_extra,
+    )
 
 
 def _dp_gather_via_all_gather(
@@ -481,18 +556,68 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    base_extra = _dp_diag_extra(
+        forward_batch,
+        is_partial=is_partial,
+        path="all_gather",
+        local_start_pos=local_start_pos,
+        local_num_tokens=local_num_tokens,
+    )
+    maybe_log_tensor_stats(
+        "dp_gather_allgather_entry_local",
+        local_tokens,
+        logger,
+        extra=base_extra,
+    )
+
     if get_attention_tp_size() == 1:
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+        maybe_log_tensor_stats(
+            "dp_gather_allgather_after_collective_global",
+            global_tokens,
+            logger,
+            extra={**base_extra, "attn_tp_size_eq_1": True},
+        )
         return
 
     if not is_partial:
         if get_attention_tp_rank() != 0:
             local_tokens.fill_(0)
+            maybe_log_tensor_stats(
+                "dp_gather_allgather_after_zero_non_src_local",
+                local_tokens,
+                logger,
+                extra=base_extra,
+            )
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
+    maybe_log_tensor_stats(
+        "dp_gather_allgather_after_tensor_split_local",
+        scattered_local_tokens,
+        logger,
+        extra={
+            **base_extra,
+            "split_alias_local": (
+                scattered_local_tokens.untyped_storage() is local_tokens.untyped_storage()
+            ),
+        },
+    )
     get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    maybe_log_tensor_stats(
+        "dp_gather_allgather_after_reduce_scatter_local",
+        scattered_local_tokens,
+        logger,
+        extra=base_extra,
+    )
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+    maybe_log_tensor_stats(
+        "dp_gather_allgather_after_collective_global",
+        global_tokens,
+        logger,
+        extra=base_extra,
+    )
 
 
 def _dp_gather(
