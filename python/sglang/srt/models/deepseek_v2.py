@@ -47,6 +47,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -197,6 +198,42 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_nan_diag_layer_watch() -> Optional[set[int]]:
+    value = os.getenv("SGLANG_NAN_DIAG_DEEPSEEK_LAYER_WATCH")
+    if not value:
+        return None
+    value = value.strip().lower()
+    if value in ("*", "all"):
+        return None
+    layers = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            layers.add(int(item))
+        except ValueError:
+            continue
+    return layers if layers else None
+
+
+_NAN_DIAG_DEEPSEEK_LAYER_INTERVAL = max(
+    0, int(os.getenv("SGLANG_NAN_DIAG_DEEPSEEK_LAYER_INTERVAL", "0"))
+)
+_NAN_DIAG_DEEPSEEK_LAYER_WATCH = _parse_nan_diag_layer_watch()
+
+
+def _should_log_deepseek_layer(layer_id: int, start_layer: int, end_layer: int) -> bool:
+    if _NAN_DIAG_DEEPSEEK_LAYER_WATCH is not None:
+        return layer_id in _NAN_DIAG_DEEPSEEK_LAYER_WATCH
+    if _NAN_DIAG_DEEPSEEK_LAYER_INTERVAL > 0:
+        return (
+            (layer_id - start_layer) % _NAN_DIAG_DEEPSEEK_LAYER_INTERVAL == 0
+            or layer_id == end_layer - 1
+        )
+    return False
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -2648,6 +2685,28 @@ class DeepseekV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        maybe_log_tensor_stats(
+            "deepseek_hidden_states_post_embed_or_pp_recv",
+            hidden_states,
+            logger,
+            extra={
+                "pp_is_first_rank": self.pp_group.is_first_rank,
+                "pp_is_last_rank": self.pp_group.is_last_rank,
+                "forward_mode": int(forward_batch.forward_mode),
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "deepseek_residual_post_pp_recv",
+                residual,
+                logger,
+                extra={
+                    "pp_is_first_rank": self.pp_group.is_first_rank,
+                    "pp_is_last_rank": self.pp_group.is_last_rank,
+                    "forward_mode": int(forward_batch.forward_mode),
+                },
+            )
+
         if nsa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
@@ -2702,6 +2761,28 @@ class DeepseekV2Model(nn.Module):
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                 )
+                if _should_log_deepseek_layer(i, normal_start_layer, normal_end_layer):
+                    maybe_log_tensor_stats(
+                        "deepseek_hidden_states_post_layer",
+                        hidden_states,
+                        logger,
+                        extra={
+                            "layer_id": i,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "tbo_enabled": bool(forward_batch.can_run_tbo),
+                        },
+                    )
+                    if residual is not None:
+                        maybe_log_tensor_stats(
+                            "deepseek_residual_post_layer",
+                            residual,
+                            logger,
+                            extra={
+                                "layer_id": i,
+                                "forward_mode": int(forward_batch.forward_mode),
+                                "tbo_enabled": bool(forward_batch.can_run_tbo),
+                            },
+                        )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -2716,6 +2797,27 @@ class DeepseekV2Model(nn.Module):
                 ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
+            maybe_log_tensor_stats(
+                "deepseek_hidden_states_post_tbo",
+                hidden_states,
+                logger,
+                extra={
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "normal_end_layer": normal_end_layer,
+                    "end_layer": self.end_layer,
+                },
+            )
+            if residual is not None:
+                maybe_log_tensor_stats(
+                    "deepseek_residual_post_tbo",
+                    residual,
+                    logger,
+                    extra={
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "normal_end_layer": normal_end_layer,
+                        "end_layer": self.end_layer,
+                    },
+                )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -2726,10 +2828,29 @@ class DeepseekV2Model(nn.Module):
             )
         else:
             if not forward_batch.forward_mode.is_idle():
+                maybe_log_tensor_stats(
+                    "deepseek_hidden_states_pre_final_norm",
+                    hidden_states,
+                    logger,
+                    extra={"forward_mode": int(forward_batch.forward_mode)},
+                )
+                if residual is not None:
+                    maybe_log_tensor_stats(
+                        "deepseek_residual_pre_final_norm",
+                        residual,
+                        logger,
+                        extra={"forward_mode": int(forward_batch.forward_mode)},
+                    )
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+                maybe_log_tensor_stats(
+                    "deepseek_hidden_states_post_final_norm",
+                    hidden_states,
+                    logger,
+                    extra={"forward_mode": int(forward_batch.forward_mode)},
+                )
 
         if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             # allgather + rerrange
@@ -2738,6 +2859,15 @@ class DeepseekV2Model(nn.Module):
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
+            )
+            maybe_log_tensor_stats(
+                "deepseek_hidden_states_post_cp_all_gather",
+                hidden_states,
+                logger,
+                extra={
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "cp_size": self.cp_size,
+                },
             )
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -2883,11 +3013,33 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        hidden_states_for_diag = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        )
+        if torch.is_tensor(hidden_states_for_diag):
+            maybe_log_tensor_stats(
+                "deepseek_model_output_hidden_states_entry",
+                hidden_states_for_diag,
+                logger,
+                extra={
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "capture_aux_hidden_states": bool(self.capture_aux_hidden_states),
+                },
+            )
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            maybe_log_tensor_stats(
+                "deepseek_hidden_states_pre_logits_processor",
+                hidden_states,
+                logger,
+                extra={
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "capture_aux_hidden_states": bool(self.capture_aux_hidden_states),
+                },
+            )
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
