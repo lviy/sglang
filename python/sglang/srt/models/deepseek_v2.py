@@ -73,6 +73,8 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
+    get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -1795,6 +1797,15 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         llama_4_scaling,
     ):
         save_kv_cache = True
+        attn_diag_extra = {
+            "layer_id": self.layer_id,
+            "forward_mode": int(forward_batch.forward_mode),
+            "attention_backend": self.current_attention_backend,
+            "attn_tp_rank": get_attention_tp_rank(),
+            "attn_tp_size": get_attention_tp_size(),
+            "attn_dp_rank": get_attention_dp_rank(),
+            "attn_dp_size": get_attention_dp_size(),
+        }
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -1858,6 +1869,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_kernel",
+            attn_output,
+            logger,
+            extra=attn_diag_extra,
+        )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -1964,7 +1981,19 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_bmm",
+            attn_bmm_output,
+            logger,
+            extra=attn_diag_extra,
+        )
         output, _ = self.o_proj(attn_bmm_output)
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_o_proj",
+            output,
+            logger,
+            extra=attn_diag_extra,
+        )
 
         return output
 
@@ -2159,6 +2188,15 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         forward_batch,
         zero_allocator,
     ):
+        attn_diag_extra = {
+            "layer_id": self.layer_id,
+            "forward_mode": int(forward_batch.forward_mode),
+            "attention_backend": self.current_attention_backend,
+            "attn_tp_rank": get_attention_tp_rank(),
+            "attn_tp_size": get_attention_tp_size(),
+            "attn_dp_rank": get_attention_dp_rank(),
+            "attn_dp_size": get_attention_dp_size(),
+        }
         decode_attention_fwd_grouped_rope(
             q_input,
             key_cache_buf,
@@ -2186,6 +2224,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_kernel",
+            attn_output,
+            logger,
+            extra=attn_diag_extra,
+        )
 
         if _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
@@ -2209,7 +2253,19 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_bmm",
+            attn_output,
+            logger,
+            extra=attn_diag_extra,
+        )
         output, _ = self.o_proj(attn_output)
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_o_proj",
+            output,
+            logger,
+            extra=attn_diag_extra,
+        )
 
         return output
 
@@ -2220,8 +2276,23 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             self
         ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
 
+        attn_diag_extra = {
+            "layer_id": self.layer_id,
+            "forward_mode": int(forward_batch.forward_mode),
+            "attention_backend": self.current_attention_backend,
+            "attn_tp_rank": get_attention_tp_rank(),
+            "attn_tp_size": get_attention_tp_size(),
+            "attn_dp_rank": get_attention_dp_rank(),
+            "attn_dp_size": get_attention_dp_size(),
+        }
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_kernel",
+            attn_output,
+            logger,
+            extra=attn_diag_extra,
+        )
 
         # [Note] Align shapes of bmm inputs.
         # Shapes of inputs:
@@ -2246,7 +2317,19 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             None,  # scale
         )
         attn_output = output
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_bmm",
+            attn_output,
+            logger,
+            extra=attn_diag_extra,
+        )
         output, _ = self.o_proj(attn_output)
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_post_o_proj",
+            output,
+            logger,
+            extra=attn_diag_extra,
+        )
 
         return output
 
