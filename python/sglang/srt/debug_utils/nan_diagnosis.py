@@ -50,6 +50,15 @@ def _parse_rank_filter() -> Optional[set[int]]:
     return ranks if ranks else None
 
 
+def _parse_stage_filter(name: str) -> Optional[list[str]]:
+    value = os.getenv(name)
+    if not value:
+        return None
+    items = [x.strip() for x in value.split(",")]
+    items = [x for x in items if x]
+    return items if items else None
+
+
 _ENABLED = _get_bool_env("SGLANG_NAN_DIAG_ENABLE", False)
 _LOG_ALL = _get_bool_env("SGLANG_NAN_DIAG_LOG_ALL", False)
 _LOG_EVERY = max(1, _get_int_env("SGLANG_NAN_DIAG_LOG_EVERY", 1))
@@ -57,6 +66,8 @@ _MAX_LOGS = max(1, _get_int_env("SGLANG_NAN_DIAG_MAX_LOGS", 200))
 _MAX_DUMPS = max(1, _get_int_env("SGLANG_NAN_DIAG_MAX_DUMPS", 8))
 _DUMP_DIR = os.getenv("SGLANG_NAN_DIAG_DUMP_DIR")
 _RANK_FILTER = _parse_rank_filter()
+_STAGE_INCLUDE = _parse_stage_filter("SGLANG_NAN_DIAG_STAGE_INCLUDE")
+_STAGE_EXCLUDE = _parse_stage_filter("SGLANG_NAN_DIAG_STAGE_EXCLUDE")
 
 _GLOBAL_LOG_COUNT = 0
 _GLOBAL_DUMP_COUNT = 0
@@ -67,6 +78,18 @@ def _is_rank_enabled() -> bool:
     if _RANK_FILTER is None:
         return True
     return _get_rank() in _RANK_FILTER
+
+
+def _is_stage_enabled(stage: str) -> bool:
+    if _STAGE_INCLUDE is not None and not any(
+        stage.startswith(prefix) for prefix in _STAGE_INCLUDE
+    ):
+        return False
+    if _STAGE_EXCLUDE is not None and any(
+        stage.startswith(prefix) for prefix in _STAGE_EXCLUDE
+    ):
+        return False
+    return True
 
 
 def _is_stream_capturing() -> bool:
@@ -97,6 +120,8 @@ def maybe_log_event(
     global _GLOBAL_LOG_COUNT
 
     if not _ENABLED or not _is_rank_enabled():
+        return False
+    if not _is_stage_enabled(stage):
         return False
 
     call_index = _next_stage_call_index(stage)
@@ -212,6 +237,8 @@ def maybe_log_tensor_stats(
     if _is_stream_capturing():
         return False
     if not _is_rank_enabled():
+        return False
+    if not _is_stage_enabled(stage):
         return False
 
     call_index = _next_stage_call_index(stage)

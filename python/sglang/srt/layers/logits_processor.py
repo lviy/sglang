@@ -389,6 +389,17 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
+        maybe_log_tensor_stats(
+            "logits_forward_hidden_states_entry",
+            hidden_states,
+            logger,
+            extra={
+                "forward_mode": int(logits_metadata.forward_mode),
+                "is_prefill_only": bool(logits_metadata.is_prefill_only),
+                "dp_lm_head": get_global_server_args().enable_dp_lm_head,
+            },
+        )
+
         # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
         multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
         if multi_item_delimiter is not None and logits_metadata.is_prefill_only:
@@ -572,6 +583,17 @@ class LogitsProcessor(nn.Module):
             # NOTE: when hidden_states_before_norm is provided, we always
             # prefer to return it.
             hidden_states_to_store = hidden_states_to_store_before_norm
+
+        maybe_log_tensor_stats(
+            "logits_forward_pruned_states_pre_get_logits",
+            pruned_states,
+            logger,
+            extra={
+                "forward_mode": int(logits_metadata.forward_mode),
+                "extend_return_logprob": bool(logits_metadata.extend_return_logprob),
+                "dp_lm_head": get_global_server_args().enable_dp_lm_head,
+            },
+        )
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
@@ -861,13 +883,35 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        maybe_log_tensor_stats(
+            "logits_hidden_states_get_logits_entry",
+            hidden_states,
+            logger,
+            extra={
+                "use_attn_tp_group": self.use_attn_tp_group,
+                "dp_lm_head": get_global_server_args().enable_dp_lm_head,
+            },
+        )
+
         if self.do_tensor_parallel_all_gather_dp_attn:
+            maybe_log_tensor_stats(
+                "logits_hidden_states_local_pre_dp_gather_replicate",
+                hidden_states,
+                logger,
+                extra={"use_attn_tp_group": self.use_attn_tp_group},
+            )
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
                 logits_metadata.gathered_buffer,
                 hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            maybe_log_tensor_stats(
+                "logits_hidden_states_post_dp_gather_replicate",
+                hidden_states,
+                logger,
+                extra={"use_attn_tp_group": self.use_attn_tp_group},
+            )
 
         maybe_log_tensor_stats(
             "logits_hidden_states_pre_lm_head",
