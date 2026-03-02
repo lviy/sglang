@@ -200,8 +200,8 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _parse_nan_diag_layer_watch() -> Optional[set[int]]:
-    value = os.getenv("SGLANG_NAN_DIAG_DEEPSEEK_LAYER_WATCH")
+def _parse_int_set_env(name: str) -> Optional[set[int]]:
+    value = os.getenv(name)
     if not value:
         return None
     value = value.strip().lower()
@@ -219,10 +219,20 @@ def _parse_nan_diag_layer_watch() -> Optional[set[int]]:
     return layers if layers else None
 
 
+def _parse_nan_diag_layer_watch() -> Optional[set[int]]:
+    return _parse_int_set_env("SGLANG_NAN_DIAG_DEEPSEEK_LAYER_WATCH")
+
+
 _NAN_DIAG_DEEPSEEK_LAYER_INTERVAL = max(
     0, int(os.getenv("SGLANG_NAN_DIAG_DEEPSEEK_LAYER_INTERVAL", "0"))
 )
 _NAN_DIAG_DEEPSEEK_LAYER_WATCH = _parse_nan_diag_layer_watch()
+_NAN_DIAG_DEEPSEEK_BLOCK_ENABLE = get_bool_env_var(
+    "SGLANG_NAN_DIAG_DEEPSEEK_BLOCK_ENABLE", "false"
+)
+_NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH = _parse_int_set_env(
+    "SGLANG_NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH"
+)
 
 
 def _should_log_deepseek_layer(layer_id: int, start_layer: int, end_layer: int) -> bool:
@@ -234,6 +244,14 @@ def _should_log_deepseek_layer(layer_id: int, start_layer: int, end_layer: int) 
             or layer_id == end_layer - 1
         )
     return False
+
+
+def _should_log_deepseek_block_layer(layer_id: int) -> bool:
+    if not _NAN_DIAG_DEEPSEEK_BLOCK_ENABLE:
+        return False
+    if _NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH is None:
+        return True
+    return layer_id in _NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -2397,12 +2415,57 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
+        if _should_log_deepseek_block_layer(self.layer_id):
+            maybe_log_tensor_stats(
+                "deepseek_layer_hidden_pre_prepare_attn",
+                hidden_states,
+                logger,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                },
+            )
+            if residual is not None:
+                maybe_log_tensor_stats(
+                    "deepseek_layer_residual_pre_prepare_attn",
+                    residual,
+                    logger,
+                    extra={
+                        "layer_id": self.layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "is_layer_sparse": bool(self.is_layer_sparse),
+                    },
+                )
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             quant_format,
         )
+        if _should_log_deepseek_block_layer(self.layer_id):
+            maybe_log_tensor_stats(
+                "deepseek_layer_hidden_post_prepare_attn",
+                hidden_states,
+                logger,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                },
+            )
+            if residual is not None:
+                maybe_log_tensor_stats(
+                    "deepseek_layer_residual_post_prepare_attn",
+                    residual,
+                    logger,
+                    extra={
+                        "layer_id": self.layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "is_layer_sparse": bool(self.is_layer_sparse),
+                    },
+                )
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -2411,10 +2474,43 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
+        if _should_log_deepseek_block_layer(self.layer_id):
+            maybe_log_tensor_stats(
+                "deepseek_layer_hidden_post_self_attn",
+                hidden_states,
+                logger,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                },
+            )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if _should_log_deepseek_block_layer(self.layer_id):
+            maybe_log_tensor_stats(
+                "deepseek_layer_hidden_post_prepare_mlp",
+                hidden_states,
+                logger,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                },
+            )
+            if residual is not None:
+                maybe_log_tensor_stats(
+                    "deepseek_layer_residual_post_prepare_mlp",
+                    residual,
+                    logger,
+                    extra={
+                        "layer_id": self.layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "is_layer_sparse": bool(self.is_layer_sparse),
+                    },
+                )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2437,6 +2533,19 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_reduce_scatter,
             gemm_output_zero_allocator,
         )
+        if _should_log_deepseek_block_layer(self.layer_id):
+            maybe_log_tensor_stats(
+                "deepseek_layer_hidden_post_mlp",
+                hidden_states,
+                logger,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                    "should_allreduce_fusion": bool(should_allreduce_fusion),
+                    "use_reduce_scatter": bool(use_reduce_scatter),
+                },
+            )
 
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2445,6 +2554,28 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+            if _should_log_deepseek_block_layer(self.layer_id):
+                maybe_log_tensor_stats(
+                    "deepseek_layer_hidden_post_postprocess",
+                    hidden_states,
+                    logger,
+                    extra={
+                        "layer_id": self.layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "is_layer_sparse": bool(self.is_layer_sparse),
+                    },
+                )
+                if residual is not None:
+                    maybe_log_tensor_stats(
+                        "deepseek_layer_residual_post_postprocess",
+                        residual,
+                        logger,
+                        extra={
+                            "layer_id": self.layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "is_layer_sparse": bool(self.is_layer_sparse),
+                        },
+                    )
 
         return hidden_states, residual
 
