@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
@@ -72,6 +73,7 @@ _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -260,6 +262,7 @@ class LayerScatterModes:
     mlp_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
+    layer_id: int = -1
 
     @classmethod
     def init_new(cls, **kwargs):
@@ -270,6 +273,7 @@ class LayerScatterModes:
             mlp_mode=cls._compute_mlp_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
+            layer_id=context.layer_id,
         )
 
     @classmethod
@@ -352,6 +356,7 @@ class LayerCommunicator:
         self.qkv_latent_func = qkv_latent_func
 
         self._context = CommunicateContext.init_new()
+        self._context.diag_layer_id = layer_scatter_modes.layer_id
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
@@ -541,13 +546,61 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
+        maybe_log_tensor_stats(
+            "comm_prepare_mlp_input_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": self._context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "attn_tp_size": self._context.attn_tp_size,
+                "attn_dp_size": self._context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_prepare_mlp_input_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": self._context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": self._context.attn_tp_size,
+                    "attn_dp_size": self._context.attn_dp_size,
+                },
+            )
+
+        hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+        maybe_log_tensor_stats(
+            "comm_prepare_mlp_output_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": self._context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "attn_tp_size": self._context.attn_tp_size,
+                "attn_dp_size": self._context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_prepare_mlp_output_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": self._context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": self._context.attn_tp_size,
+                    "attn_dp_size": self._context.attn_dp_size,
+                },
+            )
+        return hidden_states, residual
 
     def postprocess_layer(
         self,
@@ -555,13 +608,57 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        return self._communicate_summable_tensor_pair_fn(
+        maybe_log_tensor_stats(
+            "comm_postprocess_input_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": self._context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "allow_reduce_scatter": bool(self.allow_reduce_scatter),
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_postprocess_input_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": self._context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "allow_reduce_scatter": bool(self.allow_reduce_scatter),
+                },
+            )
+
+        hidden_states, residual = self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
             allow_reduce_scatter=self.allow_reduce_scatter,
         )
+        maybe_log_tensor_stats(
+            "comm_postprocess_output_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": self._context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "allow_reduce_scatter": bool(self.allow_reduce_scatter),
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_postprocess_output_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": self._context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "allow_reduce_scatter": bool(self.allow_reduce_scatter),
+                },
+            )
+        return hidden_states, residual
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
@@ -614,6 +711,7 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
+    diag_layer_id: int = -1
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -638,6 +736,7 @@ class CommunicateContext:
             attn_dp_size=attn_dp_size,
             tp_size=tp_size,
             tp_rank=tp_rank,
+            diag_layer_id=-1,
         )
 
 
@@ -745,9 +844,47 @@ class CommunicateWithAllReduceAndLayerNormFn:
         layernorm: torch.nn.Module,
         context: CommunicateContext,
     ):
+        maybe_log_tensor_stats(
+            "comm_mlp_core_simple_input_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_simple_input_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                },
+            )
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        maybe_log_tensor_stats(
+            "comm_mlp_core_simple_output_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_simple_output_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                },
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -760,6 +897,31 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
+        maybe_log_tensor_stats(
+            "comm_mlp_core_gather_entry_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "residual_input_mode": str(residual_input_mode),
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_gather_entry_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "residual_input_mode": str(residual_input_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
         if get_attn_tp_context().input_scattered:
             return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
                 hidden_states,
@@ -774,6 +936,17 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
+            maybe_log_tensor_stats(
+                "comm_mlp_core_gather_after_residual_gather",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
         if context.attn_dp_size != 1:
             if context.attn_tp_rank == 0:
                 hidden_states += residual
@@ -793,6 +966,17 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            maybe_log_tensor_stats(
+                "comm_mlp_core_gather_after_dp_gather_hidden",
+                hidden_states,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
@@ -807,9 +991,43 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                maybe_log_tensor_stats(
+                    "comm_mlp_core_gather_after_tp_allreduce_hidden",
+                    hidden_states,
+                    logger,
+                    extra={
+                        "layer_id": context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": context.attn_tp_size,
+                        "attn_dp_size": context.attn_dp_size,
+                    },
+                )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
+        maybe_log_tensor_stats(
+            "comm_mlp_core_gather_output_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_gather_output_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -822,15 +1040,74 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
+        maybe_log_tensor_stats(
+            "comm_mlp_core_scatter_entry_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "residual_input_mode": str(residual_input_mode),
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_scatter_entry_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "residual_input_mode": str(residual_input_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
         input_hidden_states = hidden_states
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
         ]
         attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        maybe_log_tensor_stats(
+            "comm_mlp_core_scatter_after_reduce_scatter_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        maybe_log_tensor_stats(
+            "comm_mlp_core_scatter_output_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_scatter_output_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -840,6 +1117,27 @@ class CommunicateWithAllReduceAndLayerNormFn:
         layernorm: torch.nn.Module,
         context: CommunicateContext,
     ):
+        maybe_log_tensor_stats(
+            "comm_mlp_core_tp_allreduce_entry_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_tp_allreduce_entry_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
@@ -847,6 +1145,26 @@ class CommunicateWithAllReduceAndLayerNormFn:
         scattered_states += residual
         residual = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = layernorm(residual)
+        maybe_log_tensor_stats(
+            "comm_mlp_core_tp_allreduce_output_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
+        maybe_log_tensor_stats(
+            "comm_mlp_core_tp_allreduce_output_residual",
+            residual,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
         return hidden_states, residual
 
 
