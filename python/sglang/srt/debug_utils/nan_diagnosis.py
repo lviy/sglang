@@ -165,21 +165,50 @@ def maybe_log_invariant(
 
 def _tensor_stats(tensor: torch.Tensor) -> Dict[str, object]:
     data = tensor.detach()
-    isnan = torch.isnan(data).any().item()
-    isinf = torch.isinf(data).any().item()
     finite_mask = torch.isfinite(data)
     finite_count = int(finite_mask.sum().item())
     total_count = data.numel()
+    non_finite_count = total_count - finite_count
+    isnan = False
+    isinf = False
 
     stats = {
         "shape": tuple(data.shape),
         "dtype": str(data.dtype),
         "device": str(data.device),
-        "isnan": bool(isnan),
-        "isinf": bool(isinf),
+        "isnan": False,
+        "isinf": False,
+        "non_finite_count": non_finite_count,
         "finite_count": finite_count,
         "total_count": total_count,
     }
+
+    if non_finite_count > 0:
+        nan_mask = torch.isnan(data)
+        inf_mask = torch.isinf(data)
+        isnan = bool(nan_mask.any().item())
+        isinf = bool(inf_mask.any().item())
+        non_finite_mask = ~finite_mask
+        first_non_finite_flat_idx = int(non_finite_mask.reshape(-1).nonzero()[0].item())
+        stats["isnan"] = isnan
+        stats["isinf"] = isinf
+        stats["nan_count"] = int(nan_mask.sum().item())
+        stats["inf_count"] = int(inf_mask.sum().item())
+        stats["first_non_finite_flat_idx"] = first_non_finite_flat_idx
+
+        if data.ndim >= 2:
+            row_mask = non_finite_mask.reshape(data.shape[0], -1).any(dim=1)
+            non_finite_row_count = int(row_mask.sum().item())
+            stats["non_finite_row_count"] = non_finite_row_count
+            if non_finite_row_count > 0:
+                first_non_finite_row = int(row_mask.nonzero()[0].item())
+                first_row_mask = non_finite_mask.reshape(data.shape[0], -1)[
+                    first_non_finite_row
+                ]
+                stats["first_non_finite_row"] = first_non_finite_row
+                stats["first_non_finite_row_non_finite_count"] = int(
+                    first_row_mask.sum().item()
+                )
 
     if finite_count > 0:
         finite_data = data[finite_mask]

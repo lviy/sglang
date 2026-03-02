@@ -955,11 +955,35 @@ class CommunicateWithAllReduceAndLayerNormFn:
             use_layer_norm_before_gather = context.attn_tp_size == 1
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
                 residual = hidden_states
+                maybe_log_tensor_stats(
+                    "comm_mlp_core_gather_pre_layernorm_hidden",
+                    hidden_states,
+                    logger,
+                    extra={
+                        "layer_id": context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": context.attn_tp_size,
+                        "attn_dp_size": context.attn_dp_size,
+                        "layernorm_before_dp_gather": True,
+                    },
+                )
                 with use_symmetric_memory(
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states = layernorm(hidden_states)
+                maybe_log_tensor_stats(
+                    "comm_mlp_core_gather_post_layernorm_hidden",
+                    hidden_states,
+                    logger,
+                    extra={
+                        "layer_id": context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": context.attn_tp_size,
+                        "attn_dp_size": context.attn_dp_size,
+                        "layernorm_before_dp_gather": True,
+                    },
+                )
 
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(),
@@ -980,15 +1004,112 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
+                maybe_log_tensor_stats(
+                    "comm_mlp_core_gather_after_dp_scatter_residual",
+                    residual,
+                    logger,
+                    extra={
+                        "layer_id": context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": context.attn_tp_size,
+                        "attn_dp_size": context.attn_dp_size,
+                    },
+                )
                 if hidden_states.shape[0] != 0:
+                    maybe_log_tensor_stats(
+                        "comm_mlp_core_gather_pre_layernorm_hidden",
+                        hidden_states,
+                        logger,
+                        extra={
+                            "layer_id": context.diag_layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "attn_tp_size": context.attn_tp_size,
+                            "attn_dp_size": context.attn_dp_size,
+                            "layernorm_before_dp_gather": False,
+                        },
+                    )
+                    maybe_log_tensor_stats(
+                        "comm_mlp_core_gather_pre_layernorm_residual",
+                        residual,
+                        logger,
+                        extra={
+                            "layer_id": context.diag_layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "attn_tp_size": context.attn_tp_size,
+                            "attn_dp_size": context.attn_dp_size,
+                            "layernorm_before_dp_gather": False,
+                        },
+                    )
                     hidden_states = layernorm(hidden_states)
+                    maybe_log_tensor_stats(
+                        "comm_mlp_core_gather_post_layernorm_hidden",
+                        hidden_states,
+                        logger,
+                        extra={
+                            "layer_id": context.diag_layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "attn_tp_size": context.attn_tp_size,
+                            "attn_dp_size": context.attn_dp_size,
+                            "layernorm_before_dp_gather": False,
+                        },
+                    )
         else:
             if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
                 layernorm, "forward_with_allreduce_fusion"
             ):
+                maybe_log_tensor_stats(
+                    "comm_mlp_core_gather_pre_layernorm_hidden",
+                    hidden_states,
+                    logger,
+                    extra={
+                        "layer_id": context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": context.attn_tp_size,
+                        "attn_dp_size": context.attn_dp_size,
+                        "use_allreduce_fusion": True,
+                    },
+                )
+                if residual is not None:
+                    maybe_log_tensor_stats(
+                        "comm_mlp_core_gather_pre_layernorm_residual",
+                        residual,
+                        logger,
+                        extra={
+                            "layer_id": context.diag_layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "attn_tp_size": context.attn_tp_size,
+                            "attn_dp_size": context.attn_dp_size,
+                            "use_allreduce_fusion": True,
+                        },
+                    )
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
+                maybe_log_tensor_stats(
+                    "comm_mlp_core_gather_post_layernorm_hidden",
+                    hidden_states,
+                    logger,
+                    extra={
+                        "layer_id": context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": context.attn_tp_size,
+                        "attn_dp_size": context.attn_dp_size,
+                        "use_allreduce_fusion": True,
+                    },
+                )
+                if residual is not None:
+                    maybe_log_tensor_stats(
+                        "comm_mlp_core_gather_post_layernorm_residual",
+                        residual,
+                        logger,
+                        extra={
+                            "layer_id": context.diag_layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "attn_tp_size": context.attn_tp_size,
+                            "attn_dp_size": context.attn_dp_size,
+                            "use_allreduce_fusion": True,
+                        },
+                    )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 maybe_log_tensor_stats(
@@ -1002,9 +1123,59 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "attn_dp_size": context.attn_dp_size,
                     },
                 )
+                maybe_log_tensor_stats(
+                    "comm_mlp_core_gather_pre_layernorm_hidden",
+                    hidden_states,
+                    logger,
+                    extra={
+                        "layer_id": context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": context.attn_tp_size,
+                        "attn_dp_size": context.attn_dp_size,
+                        "use_allreduce_fusion": False,
+                    },
+                )
+                if residual is not None:
+                    maybe_log_tensor_stats(
+                        "comm_mlp_core_gather_pre_layernorm_residual",
+                        residual,
+                        logger,
+                        extra={
+                            "layer_id": context.diag_layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "attn_tp_size": context.attn_tp_size,
+                            "attn_dp_size": context.attn_dp_size,
+                            "use_allreduce_fusion": False,
+                        },
+                    )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
+                maybe_log_tensor_stats(
+                    "comm_mlp_core_gather_post_layernorm_hidden",
+                    hidden_states,
+                    logger,
+                    extra={
+                        "layer_id": context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": context.attn_tp_size,
+                        "attn_dp_size": context.attn_dp_size,
+                        "use_allreduce_fusion": False,
+                    },
+                )
+                if residual is not None:
+                    maybe_log_tensor_stats(
+                        "comm_mlp_core_gather_post_layernorm_residual",
+                        residual,
+                        logger,
+                        extra={
+                            "layer_id": context.diag_layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "attn_tp_size": context.attn_tp_size,
+                            "attn_dp_size": context.attn_dp_size,
+                            "use_allreduce_fusion": False,
+                        },
+                    )
         maybe_log_tensor_stats(
             "comm_mlp_core_gather_output_hidden",
             hidden_states,
@@ -1066,10 +1237,26 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 },
             )
         input_hidden_states = hidden_states
-        hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
+        reduce_scatter_output = hidden_states.tensor_split(context.attn_tp_size)[
             context.attn_tp_rank
         ]
-        attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        maybe_log_tensor_stats(
+            "comm_mlp_core_scatter_after_tensor_split_hidden",
+            reduce_scatter_output,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+                "reduce_scatter_output_alias_input": (
+                    reduce_scatter_output.untyped_storage()
+                    is input_hidden_states.untyped_storage()
+                ),
+            },
+        )
+        attn_tp_reduce_scatter_tensor(reduce_scatter_output, input_hidden_states)
+        hidden_states = reduce_scatter_output
         maybe_log_tensor_stats(
             "comm_mlp_core_scatter_after_reduce_scatter_hidden",
             hidden_states,
@@ -1083,8 +1270,65 @@ class CommunicateWithAllReduceAndLayerNormFn:
         )
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
+            maybe_log_tensor_stats(
+                "comm_mlp_core_scatter_after_residual_split",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
+        maybe_log_tensor_stats(
+            "comm_mlp_core_scatter_pre_layernorm_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_scatter_pre_layernorm_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        maybe_log_tensor_stats(
+            "comm_mlp_core_scatter_post_layernorm_hidden",
+            hidden_states,
+            logger,
+            extra={
+                "layer_id": context.diag_layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "attn_tp_size": context.attn_tp_size,
+                "attn_dp_size": context.attn_dp_size,
+            },
+        )
+        if residual is not None:
+            maybe_log_tensor_stats(
+                "comm_mlp_core_scatter_post_layernorm_residual",
+                residual,
+                logger,
+                extra={
+                    "layer_id": context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": context.attn_tp_size,
+                    "attn_dp_size": context.attn_dp_size,
+                },
+            )
         maybe_log_tensor_stats(
             "comm_mlp_core_scatter_output_hidden",
             hidden_states,
