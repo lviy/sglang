@@ -62,6 +62,7 @@ def _parse_stage_filter(name: str) -> Optional[list[str]]:
 _ENABLED = _get_bool_env("SGLANG_NAN_DIAG_ENABLE", False)
 _LOG_ALL = _get_bool_env("SGLANG_NAN_DIAG_LOG_ALL", False)
 _LOG_EVERY = max(1, _get_int_env("SGLANG_NAN_DIAG_LOG_EVERY", 1))
+_ANOMALY_LOG_EVERY = max(1, _get_int_env("SGLANG_NAN_DIAG_ANOMALY_LOG_EVERY", 1))
 _MAX_LOGS = max(1, _get_int_env("SGLANG_NAN_DIAG_MAX_LOGS", 200))
 _MAX_DUMPS = max(1, _get_int_env("SGLANG_NAN_DIAG_MAX_DUMPS", 8))
 _DUMP_DIR = os.getenv("SGLANG_NAN_DIAG_DUMP_DIR")
@@ -72,6 +73,7 @@ _STAGE_EXCLUDE = _parse_stage_filter("SGLANG_NAN_DIAG_STAGE_EXCLUDE")
 _GLOBAL_LOG_COUNT = 0
 _GLOBAL_DUMP_COUNT = 0
 _STAGE_CALL_COUNTER: Dict[str, int] = {}
+_STAGE_ANOMALY_COUNTER: Dict[str, int] = {}
 
 
 def _is_rank_enabled() -> bool:
@@ -105,6 +107,21 @@ def _next_stage_call_index(stage: str) -> int:
     call_index = _STAGE_CALL_COUNTER.get(stage, 0) + 1
     _STAGE_CALL_COUNTER[stage] = call_index
     return call_index
+
+
+def _next_stage_anomaly_index(stage: str) -> int:
+    anomaly_index = _STAGE_ANOMALY_COUNTER.get(stage, 0) + 1
+    _STAGE_ANOMALY_COUNTER[stage] = anomaly_index
+    return anomaly_index
+
+
+def _safe_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
 
 
 def maybe_log_event(
@@ -274,9 +291,12 @@ def maybe_log_tensor_stats(
 
     stats = _tensor_stats(tensor)
     has_non_finite = stats["isnan"] or stats["isinf"]
+    anomaly_index = _next_stage_anomaly_index(stage) if has_non_finite else None
     should_log = has_non_finite or _LOG_ALL
     if not should_log:
         return False
+    if has_non_finite and (anomaly_index - 1) % _ANOMALY_LOG_EVERY != 0:
+        return True
     if not has_non_finite and call_index % _LOG_EVERY != 0:
         return False
     if _GLOBAL_LOG_COUNT >= _MAX_LOGS and not has_non_finite:
@@ -289,8 +309,30 @@ def maybe_log_tensor_stats(
         "call_index": call_index,
         **stats,
     }
+    if anomaly_index is not None:
+        info["anomaly_index"] = anomaly_index
     if extra:
         info.update(extra)
+    if has_non_finite and "first_non_finite_row" in stats:
+        first_row = _safe_int(stats.get("first_non_finite_row"))
+        local_start = _safe_int(info.get("local_start_pos"))
+        local_tokens = _safe_int(info.get("local_num_tokens"))
+        if (
+            first_row is not None
+            and local_start is not None
+            and local_tokens is not None
+            and local_tokens >= 0
+        ):
+            local_end = local_start + local_tokens
+            info["local_row_begin"] = local_start
+            info["local_row_end_exclusive"] = local_end
+            info["first_non_finite_in_local_range"] = (
+                local_start <= first_row < local_end
+            )
+        rows_per_shard = _safe_int(info.get("rows_per_attn_dp_shard"))
+        if first_row is not None and rows_per_shard is not None and rows_per_shard > 0:
+            info["first_non_finite_est_attn_dp_shard"] = first_row // rows_per_shard
+            info["first_non_finite_row_in_est_shard"] = first_row % rows_per_shard
 
     if has_non_finite:
         logger.warning("NaNDiag anomaly: %s", info)

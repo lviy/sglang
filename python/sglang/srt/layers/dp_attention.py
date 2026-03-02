@@ -470,7 +470,15 @@ def _dp_diag_extra(
     path: str,
     local_start_pos: Optional[torch.Tensor] = None,
     local_num_tokens: Optional[torch.Tensor] = None,
+    local_tokens_rows: Optional[int] = None,
+    global_rows: Optional[int] = None,
 ) -> dict:
+    attn_dp_size = get_attention_dp_size()
+    rows_per_attn_dp_shard = None
+    global_rows_mod_attn_dp_size = None
+    if global_rows is not None and attn_dp_size > 0:
+        rows_per_attn_dp_shard = global_rows // attn_dp_size
+        global_rows_mod_attn_dp_size = global_rows % attn_dp_size
     return {
         "forward_mode": int(forward_batch.forward_mode),
         "dp_padding_mode": str(forward_batch.dp_padding_mode),
@@ -484,9 +492,10 @@ def _dp_diag_extra(
         "tp_size": get_tensor_model_parallel_world_size(),
         "local_start_pos": _diag_safe_scalar(local_start_pos),
         "local_num_tokens": _diag_safe_scalar(local_num_tokens),
-        "local_tokens_rows": int(local_num_tokens.shape[0])
-        if isinstance(local_num_tokens, torch.Tensor) and local_num_tokens.dim() > 0
-        else None,
+        "local_tokens_rows": local_tokens_rows,
+        "global_rows": global_rows,
+        "rows_per_attn_dp_shard": rows_per_attn_dp_shard,
+        "global_rows_mod_attn_dp_size": global_rows_mod_attn_dp_size,
     }
 
 
@@ -503,6 +512,8 @@ def _dp_gather_via_all_reduce(
         path="all_reduce",
         local_start_pos=local_start_pos,
         local_num_tokens=local_num_tokens,
+        local_tokens_rows=int(local_tokens.shape[0]),
+        global_rows=int(global_tokens.shape[0]),
     )
     maybe_log_tensor_stats(
         "dp_gather_allreduce_entry_local",
@@ -563,6 +574,8 @@ def _dp_gather_via_all_gather(
         path="all_gather",
         local_start_pos=local_start_pos,
         local_num_tokens=local_num_tokens,
+        local_tokens_rows=int(local_tokens.shape[0]),
+        global_rows=int(global_tokens.shape[0]),
     )
     maybe_log_tensor_stats(
         "dp_gather_allgather_entry_local",
