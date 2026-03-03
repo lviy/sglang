@@ -47,7 +47,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
+from sglang.srt.debug_utils.nan_diagnosis import maybe_log_event, maybe_log_tensor_stats
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -1397,6 +1397,167 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             "attn_dp_size": get_attention_dp_size(),
         }
 
+    @staticmethod
+    def _first_non_finite_row(tensor: Optional[torch.Tensor]) -> Optional[int]:
+        if tensor is None or not isinstance(tensor, torch.Tensor):
+            return None
+        data = tensor.detach()
+        non_finite_mask = ~torch.isfinite(data)
+        if not bool(non_finite_mask.any().item()):
+            return None
+        if data.ndim >= 2:
+            row_mask = non_finite_mask.reshape(data.shape[0], -1).any(dim=1)
+            return int(row_mask.nonzero()[0].item())
+        return int(non_finite_mask.reshape(-1).nonzero()[0].item())
+
+    @staticmethod
+    def _tensor_tail_ints(
+        tensor: Optional[torch.Tensor], tail_size: int = 8
+    ) -> Optional[list[int]]:
+        if tensor is None or not isinstance(tensor, torch.Tensor):
+            return None
+        flat = tensor.detach().reshape(-1)
+        if flat.numel() == 0:
+            return []
+        count = min(int(flat.numel()), tail_size)
+        tail = flat[-count:].to(device="cpu")
+        return [int(x) for x in tail.tolist()]
+
+    @staticmethod
+    def _tensor_numel(tensor: Optional[torch.Tensor]) -> Optional[int]:
+        if tensor is None or not isinstance(tensor, torch.Tensor):
+            return None
+        return int(tensor.numel())
+
+    @staticmethod
+    def _get_tensor_attr(obj: object, names: list[str]) -> Optional[torch.Tensor]:
+        for name in names:
+            value = getattr(obj, name, None)
+            if isinstance(value, torch.Tensor):
+                return value
+        return None
+
+    def _log_mla_metadata_on_anomaly(
+        self,
+        *,
+        stage: str,
+        forward_batch: ForwardBatch,
+        extra: Dict[str, object],
+        first_non_finite_row: Optional[int],
+        positions: Optional[torch.Tensor] = None,
+    ) -> None:
+        metadata = getattr(getattr(forward_batch, "attn_backend", None), "forward_metadata", None)
+        qo_indptr = None
+        kv_indptr = None
+        kv_indices = None
+        kv_last_page_len = None
+        page_table = None
+        cache_seqlens = None
+
+        info: Dict[str, object] = {
+            **extra,
+            "forward_batch_size": int(getattr(forward_batch, "batch_size", 0)),
+            "first_non_finite_row": first_non_finite_row,
+            "metadata_type": type(metadata).__name__ if metadata is not None else None,
+        }
+
+        if isinstance(metadata, (tuple, list)):
+            info["metadata_is_tuple"] = True
+            info["metadata_tuple_len"] = len(metadata)
+            if len(metadata) > 2 and isinstance(metadata[2], torch.Tensor):
+                kv_indptr = metadata[2]
+            if len(metadata) > 3 and isinstance(metadata[3], torch.Tensor):
+                kv_indices = metadata[3]
+            if len(metadata) > 4 and isinstance(metadata[4], torch.Tensor):
+                kv_last_page_len = metadata[4]
+        elif metadata is not None:
+            info["metadata_is_tuple"] = False
+            qo_indptr = self._get_tensor_attr(
+                metadata, ["qo_indptr", "query_start_loc", "cu_seqlens_q"]
+            )
+            kv_indptr = self._get_tensor_attr(
+                metadata, ["kv_indptr", "cu_seqlens_k", "key_start_loc"]
+            )
+            kv_indices = self._get_tensor_attr(
+                metadata, ["kv_indices", "page_table_1_flattened"]
+            )
+            kv_last_page_len = self._get_tensor_attr(metadata, ["kv_last_page_len"])
+            page_table = self._get_tensor_attr(metadata, ["page_table", "swa_page_table"])
+            cache_seqlens = self._get_tensor_attr(
+                metadata, ["cache_seqlens_int32", "encoder_lens_int32"]
+            )
+
+        positions_tensor = positions if isinstance(positions, torch.Tensor) else None
+        if positions_tensor is None:
+            positions_tensor = getattr(forward_batch, "positions", None)
+            if not isinstance(positions_tensor, torch.Tensor):
+                positions_tensor = None
+
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
+        extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+
+        info.update(
+            {
+                "positions_numel": self._tensor_numel(positions_tensor),
+                "positions_tail": self._tensor_tail_ints(positions_tensor),
+                "out_cache_loc_numel": self._tensor_numel(out_cache_loc),
+                "out_cache_loc_tail": self._tensor_tail_ints(out_cache_loc),
+                "qo_indptr_numel": self._tensor_numel(qo_indptr),
+                "qo_indptr_tail": self._tensor_tail_ints(qo_indptr),
+                "kv_indptr_numel": self._tensor_numel(kv_indptr),
+                "kv_indptr_tail": self._tensor_tail_ints(kv_indptr),
+                "kv_indices_numel": self._tensor_numel(kv_indices),
+                "kv_indices_tail": self._tensor_tail_ints(kv_indices),
+                "kv_last_page_len_numel": self._tensor_numel(kv_last_page_len),
+                "kv_last_page_len_tail": self._tensor_tail_ints(kv_last_page_len),
+                "page_table_numel": self._tensor_numel(page_table),
+                "page_table_tail": self._tensor_tail_ints(page_table),
+                "cache_seqlens_numel": self._tensor_numel(cache_seqlens),
+                "cache_seqlens_tail": self._tensor_tail_ints(cache_seqlens),
+                "extend_start_loc_numel": self._tensor_numel(extend_start_loc),
+                "extend_start_loc_tail": self._tensor_tail_ints(extend_start_loc),
+                "extend_seq_lens_numel": self._tensor_numel(extend_seq_lens),
+                "extend_seq_lens_tail": self._tensor_tail_ints(extend_seq_lens),
+                "seq_lens_numel": self._tensor_numel(seq_lens),
+                "seq_lens_tail": self._tensor_tail_ints(seq_lens),
+            }
+        )
+
+        if (
+            first_non_finite_row is not None
+            and qo_indptr is not None
+            and qo_indptr.numel() >= 2
+        ):
+            row_tensor = torch.tensor(
+                [first_non_finite_row], device=qo_indptr.device, dtype=qo_indptr.dtype
+            )
+            req_idx = int(torch.searchsorted(qo_indptr, row_tensor, right=True).item()) - 1
+            if 0 <= req_idx < qo_indptr.numel() - 1:
+                q_begin = int(qo_indptr[req_idx].item())
+                q_end = int(qo_indptr[req_idx + 1].item())
+                info["first_non_finite_req_idx"] = req_idx
+                info["first_non_finite_row_in_req"] = first_non_finite_row - q_begin
+                info["first_non_finite_req_q_begin"] = q_begin
+                info["first_non_finite_req_q_end_exclusive"] = q_end
+                if kv_indptr is not None and kv_indptr.numel() >= req_idx + 2:
+                    info["first_non_finite_req_kv_begin"] = int(kv_indptr[req_idx].item())
+                    info["first_non_finite_req_kv_end_exclusive"] = int(
+                        kv_indptr[req_idx + 1].item()
+                    )
+                if kv_last_page_len is not None and kv_last_page_len.numel() > req_idx:
+                    info["first_non_finite_req_kv_last_page_len"] = int(
+                        kv_last_page_len[req_idx].item()
+                    )
+
+        maybe_log_event(
+            f"deepseek_attn_mla_meta_{stage}",
+            logger,
+            extra=info,
+            force=True,
+        )
+
     def _log_mla_pre_kernel_inputs(
         self,
         *,
@@ -1406,37 +1567,49 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         extra: Dict[str, object],
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-    ) -> None:
-        maybe_log_tensor_stats(
+    ) -> Optional[int]:
+        row_hint = None
+        has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_pre_kernel_q",
             q,
             logger,
             extra=extra,
         )
-        maybe_log_tensor_stats(
+        if has_non_finite:
+            row_hint = self._first_non_finite_row(q)
+        has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_pre_kernel_k",
             k,
             logger,
             extra=extra,
         )
-        maybe_log_tensor_stats(
+        if row_hint is None and has_non_finite:
+            row_hint = self._first_non_finite_row(k)
+        has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_pre_kernel_v",
             v,
             logger,
             extra=extra,
         )
-        maybe_log_tensor_stats(
+        if row_hint is None and has_non_finite:
+            row_hint = self._first_non_finite_row(v)
+        has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_pre_kernel_q_rope",
             q_rope,
             logger,
             extra=extra,
         )
-        maybe_log_tensor_stats(
+        if row_hint is None and has_non_finite:
+            row_hint = self._first_non_finite_row(q_rope)
+        has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_pre_kernel_k_rope",
             k_rope,
             logger,
             extra=extra,
         )
+        if row_hint is None and has_non_finite:
+            row_hint = self._first_non_finite_row(k_rope)
+        return row_hint
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -1860,7 +2033,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     "llama_4_scaling": llama_4_scaling,
                 }
 
-            self._log_mla_pre_kernel_inputs(
+            pre_kernel_row = self._log_mla_pre_kernel_inputs(
                 q=q_nope_out,
                 k=k_nope,
                 v=k_nope,
@@ -1868,6 +2041,14 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 k_rope=k_pe,
                 extra=attn_diag_extra,
             )
+            if pre_kernel_row is not None:
+                self._log_mla_metadata_on_anomaly(
+                    stage="pre_kernel",
+                    forward_batch=forward_batch,
+                    extra=attn_diag_extra,
+                    first_non_finite_row=pre_kernel_row,
+                    positions=positions,
+                )
             attn_output = self.attn_mqa(
                 q_nope_out,
                 k_nope,
@@ -1913,12 +2094,20 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
-            self._log_mla_pre_kernel_inputs(
+            pre_kernel_row = self._log_mla_pre_kernel_inputs(
                 q=q,
                 k=k,
                 v=k_nope,
                 extra=attn_diag_extra,
             )
+            if pre_kernel_row is not None:
+                self._log_mla_metadata_on_anomaly(
+                    stage="pre_kernel",
+                    forward_batch=forward_batch,
+                    extra=attn_diag_extra,
+                    first_non_finite_row=pre_kernel_row,
+                    positions=positions,
+                )
             attn_output = self.attn_mqa(
                 q,
                 k,
@@ -1927,12 +2116,20 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
-        maybe_log_tensor_stats(
+        post_kernel_has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_post_kernel",
             attn_output,
             logger,
             extra=attn_diag_extra,
         )
+        if post_kernel_has_non_finite:
+            self._log_mla_metadata_on_anomaly(
+                stage="post_kernel",
+                forward_batch=forward_batch,
+                extra=attn_diag_extra,
+                first_non_finite_row=self._first_non_finite_row(attn_output),
+                positions=positions,
+            )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -2247,12 +2444,20 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         zero_allocator,
     ):
         attn_diag_extra = self._build_attn_diag_extra(forward_batch)
-        self._log_mla_pre_kernel_inputs(
+        pre_kernel_row = self._log_mla_pre_kernel_inputs(
             q=q_input,
             k=k_input,
             v=None,
             extra=attn_diag_extra,
         )
+        if pre_kernel_row is not None:
+            self._log_mla_metadata_on_anomaly(
+                stage="pre_kernel",
+                forward_batch=forward_batch,
+                extra=attn_diag_extra,
+                first_non_finite_row=pre_kernel_row,
+                positions=positions,
+            )
         decode_attention_fwd_grouped_rope(
             q_input,
             key_cache_buf,
@@ -2280,12 +2485,20 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        maybe_log_tensor_stats(
+        post_kernel_has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_post_kernel",
             attn_output,
             logger,
             extra=attn_diag_extra,
         )
+        if post_kernel_has_non_finite:
+            self._log_mla_metadata_on_anomaly(
+                stage="post_kernel",
+                forward_batch=forward_batch,
+                extra=attn_diag_extra,
+                first_non_finite_row=self._first_non_finite_row(attn_output),
+                positions=positions,
+            )
 
         if _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
@@ -2333,20 +2546,34 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
 
         attn_diag_extra = self._build_attn_diag_extra(forward_batch)
-        self._log_mla_pre_kernel_inputs(
+        pre_kernel_row = self._log_mla_pre_kernel_inputs(
             q=q_input,
             k=k_input,
             v=v_input,
             extra=attn_diag_extra,
         )
+        if pre_kernel_row is not None:
+            self._log_mla_metadata_on_anomaly(
+                stage="pre_kernel",
+                forward_batch=forward_batch,
+                extra=attn_diag_extra,
+                first_non_finite_row=pre_kernel_row,
+            )
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        maybe_log_tensor_stats(
+        post_kernel_has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_post_kernel",
             attn_output,
             logger,
             extra=attn_diag_extra,
         )
+        if post_kernel_has_non_finite:
+            self._log_mla_metadata_on_anomaly(
+                stage="post_kernel",
+                forward_batch=forward_batch,
+                extra=attn_diag_extra,
+                first_non_finite_row=self._first_non_finite_row(attn_output),
+            )
 
         # [Note] Align shapes of bmm inputs.
         # Shapes of inputs:
@@ -2612,7 +2839,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
         )
         if _should_log_deepseek_block_layer(self.layer_id):
-            maybe_log_tensor_stats(
+            post_self_attn_has_non_finite = maybe_log_tensor_stats(
                 "deepseek_layer_hidden_post_self_attn",
                 hidden_states,
                 logger,
@@ -2622,6 +2849,16 @@ class DeepseekV2DecoderLayer(nn.Module):
                     "is_layer_sparse": bool(self.is_layer_sparse),
                 },
             )
+            if post_self_attn_has_non_finite:
+                self.self_attn._log_mla_metadata_on_anomaly(
+                    stage="post_self_attn_output",
+                    forward_batch=forward_batch,
+                    extra=self.self_attn._build_attn_diag_extra(forward_batch),
+                    first_non_finite_row=self.self_attn._first_non_finite_row(
+                        hidden_states
+                    ),
+                    positions=positions,
+                )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
