@@ -1386,6 +1386,58 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         return handler(self, forward_batch)
 
+    def _build_attn_diag_extra(self, forward_batch: ForwardBatch) -> Dict[str, object]:
+        return {
+            "layer_id": self.layer_id,
+            "forward_mode": int(forward_batch.forward_mode),
+            "attention_backend": self.current_attention_backend,
+            "attn_tp_rank": get_attention_tp_rank(),
+            "attn_tp_size": get_attention_tp_size(),
+            "attn_dp_rank": get_attention_dp_rank(),
+            "attn_dp_size": get_attention_dp_size(),
+        }
+
+    def _log_mla_pre_kernel_inputs(
+        self,
+        *,
+        q: Optional[torch.Tensor],
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        extra: Dict[str, object],
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ) -> None:
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_pre_kernel_q",
+            q,
+            logger,
+            extra=extra,
+        )
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_pre_kernel_k",
+            k,
+            logger,
+            extra=extra,
+        )
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_pre_kernel_v",
+            v,
+            logger,
+            extra=extra,
+        )
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_pre_kernel_q_rope",
+            q_rope,
+            logger,
+            extra=extra,
+        )
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_pre_kernel_k_rope",
+            k_rope,
+            logger,
+            extra=extra,
+        )
+
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -1797,15 +1849,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         llama_4_scaling,
     ):
         save_kv_cache = True
-        attn_diag_extra = {
-            "layer_id": self.layer_id,
-            "forward_mode": int(forward_batch.forward_mode),
-            "attention_backend": self.current_attention_backend,
-            "attn_tp_rank": get_attention_tp_rank(),
-            "attn_tp_size": get_attention_tp_size(),
-            "attn_dp_rank": get_attention_dp_rank(),
-            "attn_dp_size": get_attention_dp_size(),
-        }
+        attn_diag_extra = self._build_attn_diag_extra(forward_batch)
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -1816,6 +1860,14 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     "llama_4_scaling": llama_4_scaling,
                 }
 
+            self._log_mla_pre_kernel_inputs(
+                q=q_nope_out,
+                k=k_nope,
+                v=k_nope,
+                q_rope=q_pe,
+                k_rope=k_pe,
+                extra=attn_diag_extra,
+            )
             attn_output = self.attn_mqa(
                 q_nope_out,
                 k_nope,
@@ -1861,6 +1913,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             if llama_4_scaling is not None:
                 q *= llama_4_scaling
 
+            self._log_mla_pre_kernel_inputs(
+                q=q,
+                k=k,
+                v=k_nope,
+                extra=attn_diag_extra,
+            )
             attn_output = self.attn_mqa(
                 q,
                 k,
@@ -2188,15 +2246,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         forward_batch,
         zero_allocator,
     ):
-        attn_diag_extra = {
-            "layer_id": self.layer_id,
-            "forward_mode": int(forward_batch.forward_mode),
-            "attention_backend": self.current_attention_backend,
-            "attn_tp_rank": get_attention_tp_rank(),
-            "attn_tp_size": get_attention_tp_size(),
-            "attn_dp_rank": get_attention_dp_rank(),
-            "attn_dp_size": get_attention_dp_size(),
-        }
+        attn_diag_extra = self._build_attn_diag_extra(forward_batch)
+        self._log_mla_pre_kernel_inputs(
+            q=q_input,
+            k=k_input,
+            v=None,
+            extra=attn_diag_extra,
+        )
         decode_attention_fwd_grouped_rope(
             q_input,
             key_cache_buf,
@@ -2276,15 +2332,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             self
         ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
 
-        attn_diag_extra = {
-            "layer_id": self.layer_id,
-            "forward_mode": int(forward_batch.forward_mode),
-            "attention_backend": self.current_attention_backend,
-            "attn_tp_rank": get_attention_tp_rank(),
-            "attn_tp_size": get_attention_tp_size(),
-            "attn_dp_rank": get_attention_dp_rank(),
-            "attn_dp_size": get_attention_dp_size(),
-        }
+        attn_diag_extra = self._build_attn_diag_extra(forward_batch)
+        self._log_mla_pre_kernel_inputs(
+            q=q_input,
+            k=k_input,
+            v=v_input,
+            extra=attn_diag_extra,
+        )
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         maybe_log_tensor_stats(
