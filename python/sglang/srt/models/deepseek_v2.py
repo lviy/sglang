@@ -235,6 +235,9 @@ _NAN_DIAG_DEEPSEEK_BLOCK_ENABLE = get_bool_env_var(
 _NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH = _parse_int_set_env(
     "SGLANG_NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH"
 )
+_NAN_DIAG_MLA_GUARD_PADDING = get_bool_env_var(
+    "SGLANG_NAN_DIAG_MLA_GUARD_PADDING", "false"
+)
 
 
 def _should_log_deepseek_layer(layer_id: int, start_layer: int, end_layer: int) -> bool:
@@ -1437,6 +1440,105 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 return value
         return None
 
+    def _get_q_total_rows_from_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[int]:
+        metadata = getattr(getattr(forward_batch, "attn_backend", None), "forward_metadata", None)
+        qo_indptr = None
+        if isinstance(metadata, (tuple, list)):
+            return None
+        if metadata is not None:
+            qo_indptr = self._get_tensor_attr(
+                metadata, ["qo_indptr", "query_start_loc", "cu_seqlens_q"]
+            )
+        if qo_indptr is None or qo_indptr.numel() == 0:
+            return None
+        return int(qo_indptr[-1].item())
+
+    @staticmethod
+    def _masked_zero_rows(
+        tensor: Optional[torch.Tensor], row_mask: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if (
+            tensor is None
+            or not isinstance(tensor, torch.Tensor)
+            or row_mask is None
+            or not isinstance(row_mask, torch.Tensor)
+            or tensor.ndim == 0
+            or tensor.shape[0] == 0
+            or row_mask.numel() == 0
+        ):
+            return tensor
+        rows = min(int(tensor.shape[0]), int(row_mask.shape[0]))
+        if rows <= 0:
+            return tensor
+        row_mask = row_mask[:rows]
+        if not bool(row_mask.any().item()):
+            return tensor
+        out = tensor.clone()
+        out[:rows][row_mask] = 0
+        return out
+
+    def _sanitize_mla_padding_rows(
+        self,
+        forward_batch: ForwardBatch,
+        q: Optional[torch.Tensor],
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ) -> tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        if not _NAN_DIAG_MLA_GUARD_PADDING:
+            return q, k, v, q_rope, k_rope, None
+        source = q if isinstance(q, torch.Tensor) else k
+        if source is None or source.ndim == 0 or source.shape[0] == 0:
+            return q, k, v, q_rope, k_rope, None
+
+        row_count = int(source.shape[0])
+        row_mask = torch.zeros(row_count, dtype=torch.bool, device=source.device)
+
+        q_total_rows = self._get_q_total_rows_from_metadata(forward_batch)
+        if q_total_rows is not None and q_total_rows < row_count:
+            row_mask[q_total_rows:row_count] = True
+
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if isinstance(out_cache_loc, torch.Tensor) and out_cache_loc.numel() > 0:
+            n = min(row_count, int(out_cache_loc.shape[0]))
+            row_mask[:n] |= out_cache_loc[:n] == 0
+
+        if not bool(row_mask.any().item()):
+            return q, k, v, q_rope, k_rope, None
+
+        maybe_log_event(
+            "deepseek_attn_mla_padding_guard",
+            logger,
+            extra={
+                "layer_id": self.layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "masked_row_count": int(row_mask.sum().item()),
+                "first_masked_row": int(row_mask.nonzero()[0].item()),
+                "q_total_rows_from_metadata": q_total_rows,
+                "source_rows": row_count,
+            },
+            force=True,
+        )
+
+        return (
+            self._masked_zero_rows(q, row_mask),
+            self._masked_zero_rows(k, row_mask),
+            self._masked_zero_rows(v, row_mask),
+            self._masked_zero_rows(q_rope, row_mask),
+            self._masked_zero_rows(k_rope, row_mask),
+            row_mask,
+        )
+
     def _log_mla_metadata_on_anomaly(
         self,
         *,
@@ -2096,6 +2198,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
     ):
         save_kv_cache = True
         attn_diag_extra = self._build_attn_diag_extra(forward_batch)
+        kernel_row_mask = None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -2123,13 +2226,28 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     positions=positions,
                     source_tensor=q_nope_out,
                 )
-            attn_output = self.attn_mqa(
+            (
+                q_nope_kernel,
+                k_nope_kernel,
+                v_nope_kernel,
+                q_pe_kernel,
+                k_pe_kernel,
+                kernel_row_mask,
+            ) = self._sanitize_mla_padding_rows(
+                forward_batch,
                 q_nope_out,
                 k_nope,
                 k_nope,
+                q_pe,
+                k_pe,
+            )
+            attn_output = self.attn_mqa(
+                q_nope_kernel,
+                k_nope_kernel,
+                v_nope_kernel,
                 forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
+                q_rope=q_pe_kernel,
+                k_rope=k_pe_kernel,
                 **extra_args,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
@@ -2183,14 +2301,29 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     positions=positions,
                     source_tensor=q,
                 )
-            attn_output = self.attn_mqa(
+            (
+                q_kernel,
+                k_kernel,
+                v_kernel,
+                _,
+                _,
+                kernel_row_mask,
+            ) = self._sanitize_mla_padding_rows(
+                forward_batch,
                 q,
                 k,
                 k_nope,
+            )
+            attn_output = self.attn_mqa(
+                q_kernel,
+                k_kernel,
+                v_kernel,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        if kernel_row_mask is not None:
+            attn_output = self._masked_zero_rows(attn_output, kernel_row_mask)
         post_kernel_has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_post_kernel",
             attn_output,
@@ -2535,6 +2668,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 positions=positions,
                 source_tensor=q_input,
             )
+        q_input, k_input, _, _, _, kernel_row_mask = self._sanitize_mla_padding_rows(
+            forward_batch,
+            q_input,
+            k_input,
+            None,
+        )
         decode_attention_fwd_grouped_rope(
             q_input,
             key_cache_buf,
@@ -2554,6 +2693,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             use_rope=enable_rope_fusion,
             is_neox_style=self.rotary_emb.is_neox_style,
         )
+
+        if kernel_row_mask is not None:
+            attn_output = self._masked_zero_rows(attn_output, kernel_row_mask)
 
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
@@ -2638,7 +2780,15 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 first_non_finite_row=pre_kernel_row,
                 source_tensor=q_input,
             )
+        q_input, k_input, v_input, _, _, kernel_row_mask = self._sanitize_mla_padding_rows(
+            forward_batch,
+            q_input,
+            k_input,
+            v_input,
+        )
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
+        if kernel_row_mask is not None:
+            attn_output = self._masked_zero_rows(attn_output, kernel_row_mask)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         post_kernel_has_non_finite = maybe_log_tensor_stats(
             "deepseek_attn_mla_post_kernel",
