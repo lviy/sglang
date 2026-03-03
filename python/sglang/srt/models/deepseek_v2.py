@@ -1503,32 +1503,52 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         row_count = int(source.shape[0])
         row_mask = torch.zeros(row_count, dtype=torch.bool, device=source.device)
+        mask_from_q_total = torch.zeros_like(row_mask)
+        mask_from_out_cache_zero = torch.zeros_like(row_mask)
 
         q_total_rows = self._get_q_total_rows_from_metadata(forward_batch)
         if q_total_rows is not None and q_total_rows < row_count:
-            row_mask[q_total_rows:row_count] = True
+            mask_from_q_total[q_total_rows:row_count] = True
+            row_mask |= mask_from_q_total
 
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         if isinstance(out_cache_loc, torch.Tensor) and out_cache_loc.numel() > 0:
             n = min(row_count, int(out_cache_loc.shape[0]))
-            row_mask[:n] |= out_cache_loc[:n] == 0
+            mask_from_out_cache_zero[:n] = out_cache_loc[:n] == 0
+            row_mask[:n] |= mask_from_out_cache_zero[:n]
 
         if not bool(row_mask.any().item()):
             return q, k, v, q_rope, k_rope, None
 
-        maybe_log_event(
-            "deepseek_attn_mla_padding_guard",
-            logger,
-            extra={
-                "layer_id": self.layer_id,
-                "forward_mode": int(forward_batch.forward_mode),
-                "masked_row_count": int(row_mask.sum().item()),
-                "first_masked_row": int(row_mask.nonzero()[0].item()),
-                "q_total_rows_from_metadata": q_total_rows,
-                "source_rows": row_count,
-            },
-            force=True,
+        masked_row_count = int(row_mask.sum().item())
+        first_masked_row = int(row_mask.nonzero()[0].item())
+        # One trailing masked row is common with dummy/padding slots; skip noisy logs.
+        expected_tail_only = (
+            masked_row_count == 1
+            and first_masked_row == row_count - 1
+            and (q_total_rows is None or q_total_rows >= row_count - 1)
         )
+
+        if not expected_tail_only:
+            out_cache_zero_first_row = None
+            if bool(mask_from_out_cache_zero.any().item()):
+                out_cache_zero_first_row = int(mask_from_out_cache_zero.nonzero()[0].item())
+            maybe_log_event(
+                "deepseek_attn_mla_padding_guard",
+                logger,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "masked_row_count": masked_row_count,
+                    "first_masked_row": first_masked_row,
+                    "masked_from_q_total_count": int(mask_from_q_total.sum().item()),
+                    "masked_from_out_cache_zero_count": int(mask_from_out_cache_zero.sum().item()),
+                    "out_cache_zero_first_row": out_cache_zero_first_row,
+                    "q_total_rows_from_metadata": q_total_rows,
+                    "source_rows": row_count,
+                },
+                force=True,
+            )
 
         return (
             self._masked_zero_rows(q, row_mask),
