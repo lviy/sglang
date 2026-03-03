@@ -1445,6 +1445,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         extra: Dict[str, object],
         first_non_finite_row: Optional[int],
         positions: Optional[torch.Tensor] = None,
+        source_tensor: Optional[torch.Tensor] = None,
     ) -> None:
         metadata = getattr(getattr(forward_batch, "attn_backend", None), "forward_metadata", None)
         qo_indptr = None
@@ -1459,6 +1460,17 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             "forward_batch_size": int(getattr(forward_batch, "batch_size", 0)),
             "first_non_finite_row": first_non_finite_row,
             "metadata_type": type(metadata).__name__ if metadata is not None else None,
+            "source_tensor_rows": (
+                int(source_tensor.shape[0])
+                if isinstance(source_tensor, torch.Tensor)
+                and source_tensor.ndim >= 1
+                else None
+            ),
+            "source_tensor_shape": (
+                tuple(source_tensor.shape)
+                if isinstance(source_tensor, torch.Tensor)
+                else None
+            ),
         }
 
         if isinstance(metadata, (tuple, list)):
@@ -1497,6 +1509,23 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         extend_start_loc = getattr(forward_batch, "extend_start_loc", None)
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
         seq_lens = getattr(forward_batch, "seq_lens", None)
+        q_total_rows = None
+        if qo_indptr is not None and qo_indptr.numel() > 0:
+            q_total_rows = int(qo_indptr[-1].item())
+
+        out_cache_loc_zero_count = None
+        out_cache_loc_zero_indices = None
+        if isinstance(out_cache_loc, torch.Tensor) and out_cache_loc.numel() > 0:
+            out_zero = out_cache_loc == 0
+            out_cache_loc_zero_count = int(out_zero.sum().item())
+            if out_cache_loc_zero_count > 0:
+                out_cache_loc_zero_indices = [
+                    int(x)
+                    for x in out_zero.nonzero(as_tuple=False).reshape(-1)[:8]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
 
         info.update(
             {
@@ -1522,6 +1551,24 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 "extend_seq_lens_tail": self._tensor_tail_ints(extend_seq_lens),
                 "seq_lens_numel": self._tensor_numel(seq_lens),
                 "seq_lens_tail": self._tensor_tail_ints(seq_lens),
+                "q_total_rows_from_qo_indptr": q_total_rows,
+                "q_rows_mismatch_with_source_tensor": (
+                    bool(
+                        isinstance(source_tensor, torch.Tensor)
+                        and source_tensor.ndim >= 1
+                        and q_total_rows is not None
+                        and int(source_tensor.shape[0]) != q_total_rows
+                    )
+                    if isinstance(source_tensor, torch.Tensor) and source_tensor.ndim >= 1
+                    else None
+                ),
+                "first_non_finite_row_outside_q_range": (
+                    bool(first_non_finite_row is not None and q_total_rows is not None and first_non_finite_row >= q_total_rows)
+                    if first_non_finite_row is not None
+                    else None
+                ),
+                "out_cache_loc_zero_count": out_cache_loc_zero_count,
+                "out_cache_loc_zero_indices": out_cache_loc_zero_indices,
             }
         )
 
@@ -1550,6 +1597,32 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     info["first_non_finite_req_kv_last_page_len"] = int(
                         kv_last_page_len[req_idx].item()
                     )
+
+        kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if kv_pool is not None:
+            try:
+                key_buf = kv_pool.get_key_buffer(self.attn_mqa.layer_id)
+                if isinstance(key_buf, torch.Tensor) and key_buf.numel() > 0:
+                    slot0 = key_buf[0]
+                    slot0_non_finite = ~torch.isfinite(slot0)
+                    info["kv_slot0_non_finite_count"] = int(slot0_non_finite.sum().item())
+                    info["kv_slot0_has_non_finite"] = bool(slot0_non_finite.any().item())
+
+                    if isinstance(out_cache_loc, torch.Tensor) and out_cache_loc.numel() > 0:
+                        max_idx = int(key_buf.shape[0]) - 1
+                        last_out_idx = int(out_cache_loc[-1].item())
+                        info["last_out_cache_loc_idx"] = last_out_idx
+                        if 0 <= last_out_idx <= max_idx:
+                            last_slot = key_buf[last_out_idx]
+                            last_slot_non_finite = ~torch.isfinite(last_slot)
+                            info["kv_last_out_slot_non_finite_count"] = int(
+                                last_slot_non_finite.sum().item()
+                            )
+                            info["kv_last_out_slot_has_non_finite"] = bool(
+                                last_slot_non_finite.any().item()
+                            )
+            except Exception as e:
+                info["kv_slot_probe_error"] = str(e)
 
         maybe_log_event(
             f"deepseek_attn_mla_meta_{stage}",
@@ -2048,6 +2121,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     extra=attn_diag_extra,
                     first_non_finite_row=pre_kernel_row,
                     positions=positions,
+                    source_tensor=q_nope_out,
                 )
             attn_output = self.attn_mqa(
                 q_nope_out,
@@ -2107,6 +2181,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     extra=attn_diag_extra,
                     first_non_finite_row=pre_kernel_row,
                     positions=positions,
+                    source_tensor=q,
                 )
             attn_output = self.attn_mqa(
                 q,
@@ -2129,6 +2204,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 extra=attn_diag_extra,
                 first_non_finite_row=self._first_non_finite_row(attn_output),
                 positions=positions,
+                source_tensor=attn_output,
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
@@ -2457,6 +2533,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 extra=attn_diag_extra,
                 first_non_finite_row=pre_kernel_row,
                 positions=positions,
+                source_tensor=q_input,
             )
         decode_attention_fwd_grouped_rope(
             q_input,
@@ -2498,6 +2575,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 extra=attn_diag_extra,
                 first_non_finite_row=self._first_non_finite_row(attn_output),
                 positions=positions,
+                source_tensor=attn_output,
             )
 
         if _is_hip:
@@ -2558,6 +2636,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 forward_batch=forward_batch,
                 extra=attn_diag_extra,
                 first_non_finite_row=pre_kernel_row,
+                source_tensor=q_input,
             )
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -2573,6 +2652,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 forward_batch=forward_batch,
                 extra=attn_diag_extra,
                 first_non_finite_row=self._first_non_finite_row(attn_output),
+                source_tensor=attn_output,
             )
 
         # [Note] Align shapes of bmm inputs.
@@ -2858,6 +2938,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                         hidden_states
                     ),
                     positions=positions,
+                    source_tensor=hidden_states,
                 )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
