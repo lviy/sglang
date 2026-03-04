@@ -238,6 +238,14 @@ _NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH = _parse_int_set_env(
 _NAN_DIAG_MLA_GUARD_PADDING = get_bool_env_var(
     "SGLANG_NAN_DIAG_MLA_GUARD_PADDING", "false"
 )
+_NAN_DIAG_DEEPSEEK_META_LOG_ONCE = get_bool_env_var(
+    "SGLANG_NAN_DIAG_DEEPSEEK_META_LOG_ONCE", "true"
+)
+_NAN_DIAG_DEEPSEEK_META_MAX_EVENTS = max(
+    1, int(os.getenv("SGLANG_NAN_DIAG_DEEPSEEK_META_MAX_EVENTS", "64"))
+)
+_NAN_DIAG_DEEPSEEK_META_EVENT_COUNT = 0
+_NAN_DIAG_DEEPSEEK_META_SEEN_KEYS: set[tuple[str, int]] = set()
 
 
 def _should_log_deepseek_layer(layer_id: int, start_layer: int, end_layer: int) -> bool:
@@ -257,6 +265,20 @@ def _should_log_deepseek_block_layer(layer_id: int) -> bool:
     if _NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH is None:
         return True
     return layer_id in _NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH
+
+
+def _should_emit_deepseek_meta(stage: str, layer_id: int) -> bool:
+    global _NAN_DIAG_DEEPSEEK_META_EVENT_COUNT
+    if not _NAN_DIAG_DEEPSEEK_META_LOG_ONCE:
+        return True
+    key = (stage, layer_id)
+    if key in _NAN_DIAG_DEEPSEEK_META_SEEN_KEYS:
+        return False
+    if _NAN_DIAG_DEEPSEEK_META_EVENT_COUNT >= _NAN_DIAG_DEEPSEEK_META_MAX_EVENTS:
+        return False
+    _NAN_DIAG_DEEPSEEK_META_SEEN_KEYS.add(key)
+    _NAN_DIAG_DEEPSEEK_META_EVENT_COUNT += 1
+    return True
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -1529,7 +1551,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             and (q_total_rows is None or q_total_rows >= row_count - 1)
         )
 
-        if not expected_tail_only:
+        if not expected_tail_only and _should_emit_deepseek_meta(
+            "padding_guard", self.layer_id
+        ):
             out_cache_zero_first_row = None
             if bool(mask_from_out_cache_zero.any().item()):
                 out_cache_zero_first_row = int(mask_from_out_cache_zero.nonzero()[0].item())
@@ -1569,6 +1593,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         positions: Optional[torch.Tensor] = None,
         source_tensor: Optional[torch.Tensor] = None,
     ) -> None:
+        if not _should_emit_deepseek_meta(f"meta_{stage}", self.layer_id):
+            return
         metadata = getattr(getattr(forward_batch, "attn_backend", None), "forward_metadata", None)
         qo_indptr = None
         kv_indptr = None

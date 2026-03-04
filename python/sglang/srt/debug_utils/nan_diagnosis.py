@@ -64,6 +64,10 @@ _LOG_ALL = _get_bool_env("SGLANG_NAN_DIAG_LOG_ALL", False)
 _LOG_EVERY = max(1, _get_int_env("SGLANG_NAN_DIAG_LOG_EVERY", 1))
 _ANOMALY_LOG_EVERY = max(1, _get_int_env("SGLANG_NAN_DIAG_ANOMALY_LOG_EVERY", 1))
 _MAX_LOGS = max(1, _get_int_env("SGLANG_NAN_DIAG_MAX_LOGS", 200))
+_MAX_ANOMALY_LOGS = max(1, _get_int_env("SGLANG_NAN_DIAG_MAX_ANOMALY_LOGS", 80))
+_MAX_ANOMALY_LOGS_PER_STAGE = max(
+    1, _get_int_env("SGLANG_NAN_DIAG_MAX_ANOMALY_LOGS_PER_STAGE", 2)
+)
 _MAX_DUMPS = max(1, _get_int_env("SGLANG_NAN_DIAG_MAX_DUMPS", 8))
 _DUMP_DIR = os.getenv("SGLANG_NAN_DIAG_DUMP_DIR")
 _RANK_FILTER = _parse_rank_filter()
@@ -71,9 +75,11 @@ _STAGE_INCLUDE = _parse_stage_filter("SGLANG_NAN_DIAG_STAGE_INCLUDE")
 _STAGE_EXCLUDE = _parse_stage_filter("SGLANG_NAN_DIAG_STAGE_EXCLUDE")
 
 _GLOBAL_LOG_COUNT = 0
+_GLOBAL_ANOMALY_LOG_COUNT = 0
 _GLOBAL_DUMP_COUNT = 0
 _STAGE_CALL_COUNTER: Dict[str, int] = {}
 _STAGE_ANOMALY_COUNTER: Dict[str, int] = {}
+_STAGE_ANOMALY_LOG_COUNTER: Dict[str, int] = {}
 
 
 def _is_rank_enabled() -> bool:
@@ -139,6 +145,9 @@ def maybe_log_event(
     if not _ENABLED or not _is_rank_enabled():
         return False
     if not _is_stage_enabled(stage):
+        return False
+
+    if _GLOBAL_LOG_COUNT >= _MAX_LOGS:
         return False
 
     call_index = _next_stage_call_index(stage)
@@ -275,7 +284,7 @@ def maybe_log_tensor_stats(
     logger: logging.Logger,
     extra: Optional[Dict[str, object]] = None,
 ) -> bool:
-    global _GLOBAL_LOG_COUNT
+    global _GLOBAL_LOG_COUNT, _GLOBAL_ANOMALY_LOG_COUNT
 
     if not _ENABLED or tensor is None or not isinstance(tensor, torch.Tensor):
         return False
@@ -297,6 +306,12 @@ def maybe_log_tensor_stats(
         return False
     if has_non_finite and (anomaly_index - 1) % _ANOMALY_LOG_EVERY != 0:
         return True
+    if has_non_finite:
+        if _GLOBAL_ANOMALY_LOG_COUNT >= _MAX_ANOMALY_LOGS:
+            return True
+        stage_anomaly_log_count = _STAGE_ANOMALY_LOG_COUNTER.get(stage, 0)
+        if stage_anomaly_log_count >= _MAX_ANOMALY_LOGS_PER_STAGE:
+            return True
     if not has_non_finite and call_index % _LOG_EVERY != 0:
         return False
     if _GLOBAL_LOG_COUNT >= _MAX_LOGS and not has_non_finite:
@@ -336,6 +351,10 @@ def maybe_log_tensor_stats(
 
     if has_non_finite:
         logger.warning("NaNDiag anomaly: %s", info)
+        _GLOBAL_ANOMALY_LOG_COUNT += 1
+        _STAGE_ANOMALY_LOG_COUNTER[stage] = (
+            _STAGE_ANOMALY_LOG_COUNTER.get(stage, 0) + 1
+        )
         _dump_tensor(stage, tensor, extra)
     else:
         logger.info("NaNDiag stats: %s", info)
