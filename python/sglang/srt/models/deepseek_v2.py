@@ -238,6 +238,9 @@ _NAN_DIAG_DEEPSEEK_BLOCK_LAYER_WATCH = _parse_int_set_env(
 _NAN_DIAG_MLA_GUARD_PADDING = get_bool_env_var(
     "SGLANG_NAN_DIAG_MLA_GUARD_PADDING", "false"
 )
+_NAN_DIAG_MLP_GUARD_PADDING = get_bool_env_var(
+    "SGLANG_NAN_DIAG_MLP_GUARD_PADDING", "false"
+)
 _NAN_DIAG_DEEPSEEK_META_LOG_ONCE = get_bool_env_var(
     "SGLANG_NAN_DIAG_DEEPSEEK_META_LOG_ONCE", "true"
 )
@@ -3018,6 +3021,22 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _sanitize_pre_mlp_padding_rows(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not _NAN_DIAG_MLP_GUARD_PADDING:
+            return hidden_states, residual
+        hidden_states, _, residual, _, _, _ = self.self_attn._sanitize_mla_padding_rows(
+            forward_batch,
+            hidden_states,
+            None,
+            residual,
+        )
+        return hidden_states, residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -3137,6 +3156,43 @@ class DeepseekV2DecoderLayer(nn.Module):
                     source_tensor=hidden_states,
                 )
 
+        if _should_log_deepseek_block_layer(self.layer_id):
+            pre_prepare_mlp_has_non_finite = maybe_log_tensor_stats(
+                "deepseek_layer_hidden_pre_prepare_mlp",
+                hidden_states,
+                logger,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                },
+            )
+            if residual is not None:
+                maybe_log_tensor_stats(
+                    "deepseek_layer_residual_pre_prepare_mlp",
+                    residual,
+                    logger,
+                    extra={
+                        "layer_id": self.layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "is_layer_sparse": bool(self.is_layer_sparse),
+                    },
+                )
+            if pre_prepare_mlp_has_non_finite:
+                self.self_attn._log_mla_metadata_on_anomaly(
+                    stage="pre_prepare_mlp_input",
+                    forward_batch=forward_batch,
+                    extra=self.self_attn._build_attn_diag_extra(forward_batch),
+                    first_non_finite_row=self.self_attn._first_non_finite_row(
+                        hidden_states
+                    ),
+                    positions=positions,
+                    source_tensor=hidden_states,
+                )
+
+        hidden_states, residual = self._sanitize_pre_mlp_padding_rows(
+            hidden_states, residual, forward_batch
+        )
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
