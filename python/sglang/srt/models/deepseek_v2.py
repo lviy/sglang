@@ -241,6 +241,12 @@ _NAN_DIAG_MLA_GUARD_PADDING = get_bool_env_var(
 _NAN_DIAG_MLP_GUARD_PADDING = get_bool_env_var(
     "SGLANG_NAN_DIAG_MLP_GUARD_PADDING", "false"
 )
+_NAN_DIAG_SYNC_AFTER_SELF_ATTN = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SYNC_AFTER_SELF_ATTN", "false"
+)
+_NAN_DIAG_SYNC_BEFORE_PREPARE_MLP = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SYNC_BEFORE_PREPARE_MLP", "false"
+)
 _NAN_DIAG_DEEPSEEK_META_LOG_ONCE = get_bool_env_var(
     "SGLANG_NAN_DIAG_DEEPSEEK_META_LOG_ONCE", "true"
 )
@@ -282,6 +288,17 @@ def _should_emit_deepseek_meta(stage: str, layer_id: int) -> bool:
     _NAN_DIAG_DEEPSEEK_META_SEEN_KEYS.add(key)
     _NAN_DIAG_DEEPSEEK_META_EVENT_COUNT += 1
     return True
+
+
+def _maybe_nan_diag_cuda_sync(enabled: bool) -> None:
+    if not enabled or not torch.cuda.is_available():
+        return
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        return
+    torch.cuda.synchronize()
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -3133,6 +3150,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
+        _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_AFTER_SELF_ATTN)
         if _should_log_deepseek_block_layer(self.layer_id):
             post_self_attn_has_non_finite = maybe_log_tensor_stats(
                 "deepseek_layer_hidden_post_self_attn",
@@ -3190,6 +3208,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     source_tensor=hidden_states,
                 )
 
+        _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_BEFORE_PREPARE_MLP)
         hidden_states, residual = self._sanitize_pre_mlp_padding_rows(
             hidden_states, residual, forward_batch
         )

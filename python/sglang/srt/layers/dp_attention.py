@@ -43,6 +43,15 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_NAN_DIAG_DP_GATHER_GUARD_PADDING = get_bool_env_var(
+    "SGLANG_NAN_DIAG_DP_GATHER_GUARD_PADDING", "false"
+)
+_NAN_DIAG_SYNC_BEFORE_DP_GATHER = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SYNC_BEFORE_DP_GATHER", "false"
+)
+_NAN_DIAG_SYNC_AFTER_DP_GATHER = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SYNC_AFTER_DP_GATHER", "false"
+)
 
 
 class DpPaddingMode(IntEnum):
@@ -499,6 +508,17 @@ def _dp_diag_extra(
     }
 
 
+def _maybe_nan_diag_cuda_sync(enabled: bool) -> None:
+    if not enabled or not torch.cuda.is_available():
+        return
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        return
+    torch.cuda.synchronize()
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -519,8 +539,9 @@ def _dp_gather_via_all_reduce(
         "dp_gather_allreduce_entry_local",
         local_tokens,
         logger,
-        extra=base_extra,
+        extra={**base_extra, "row_index_space": "local"},
     )
+    _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_BEFORE_DP_GATHER)
 
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
@@ -538,7 +559,7 @@ def _dp_gather_via_all_reduce(
         "dp_gather_allreduce_after_copy_global",
         global_tokens,
         logger,
-        extra=base_extra,
+        extra={**base_extra, "row_index_space": "global"},
     )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
@@ -557,8 +578,9 @@ def _dp_gather_via_all_reduce(
         "dp_gather_allreduce_after_collective_global",
         global_tokens,
         logger,
-        extra=base_extra,
+        extra={**base_extra, "row_index_space": "global"},
     )
+    _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_AFTER_DP_GATHER)
 
 
 def _dp_gather_via_all_gather(
@@ -581,8 +603,30 @@ def _dp_gather_via_all_gather(
         "dp_gather_allgather_entry_local",
         local_tokens,
         logger,
-        extra=base_extra,
+        extra={**base_extra, "row_index_space": "local"},
     )
+    _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_BEFORE_DP_GATHER)
+    # In MAX_LEN mode, local_tokens can carry tail padding rows. Guarding here helps
+    # verify whether stale padding rows are the source of cross-shard NaN propagation.
+    if _NAN_DIAG_DP_GATHER_GUARD_PADDING:
+        local_num_tokens_i = _diag_safe_scalar(local_num_tokens)
+        if (
+            local_num_tokens_i is not None
+            and local_tokens.ndim > 0
+            and local_tokens.shape[0] > local_num_tokens_i >= 0
+        ):
+            local_tokens[local_num_tokens_i:].fill_(0)
+            maybe_log_tensor_stats(
+                "dp_gather_allgather_after_guard_padding_local",
+                local_tokens,
+                logger,
+                extra={
+                    **base_extra,
+                    "row_index_space": "local",
+                    "guard_enabled": True,
+                    "guard_local_num_tokens": local_num_tokens_i,
+                },
+            )
 
     if get_attention_tp_size() == 1:
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
@@ -590,8 +634,13 @@ def _dp_gather_via_all_gather(
             "dp_gather_allgather_after_collective_global",
             global_tokens,
             logger,
-            extra={**base_extra, "attn_tp_size_eq_1": True},
+            extra={
+                **base_extra,
+                "row_index_space": "global",
+                "attn_tp_size_eq_1": True,
+            },
         )
+        _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_AFTER_DP_GATHER)
         return
 
     if not is_partial:
@@ -601,7 +650,7 @@ def _dp_gather_via_all_gather(
                 "dp_gather_allgather_after_zero_non_src_local",
                 local_tokens,
                 logger,
-                extra=base_extra,
+                extra={**base_extra, "row_index_space": "local"},
             )
     scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
@@ -612,6 +661,7 @@ def _dp_gather_via_all_gather(
         logger,
         extra={
             **base_extra,
+            "row_index_space": "local",
             "split_alias_local": (
                 scattered_local_tokens.untyped_storage() is local_tokens.untyped_storage()
             ),
@@ -622,15 +672,16 @@ def _dp_gather_via_all_gather(
         "dp_gather_allgather_after_reduce_scatter_local",
         scattered_local_tokens,
         logger,
-        extra=base_extra,
+        extra={**base_extra, "row_index_space": "local"},
     )
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
     maybe_log_tensor_stats(
         "dp_gather_allgather_after_collective_global",
         global_tokens,
         logger,
-        extra=base_extra,
+        extra={**base_extra, "row_index_space": "global"},
     )
+    _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_AFTER_DP_GATHER)
 
 
 def _dp_gather(

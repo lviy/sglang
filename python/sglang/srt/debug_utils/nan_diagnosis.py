@@ -332,22 +332,39 @@ def maybe_log_tensor_stats(
         first_row = _safe_int(stats.get("first_non_finite_row"))
         local_start = _safe_int(info.get("local_start_pos"))
         local_tokens = _safe_int(info.get("local_num_tokens"))
+        row_index_space = str(info.get("row_index_space", "global")).lower()
+        row_for_shard_est = first_row
         if (
             first_row is not None
-            and local_start is not None
             and local_tokens is not None
             and local_tokens >= 0
         ):
-            local_end = local_start + local_tokens
-            info["local_row_begin"] = local_start
-            info["local_row_end_exclusive"] = local_end
-            info["first_non_finite_in_local_range"] = (
-                local_start <= first_row < local_end
-            )
+            if row_index_space == "local":
+                info["local_row_begin"] = 0
+                info["local_row_end_exclusive"] = local_tokens
+                info["first_non_finite_in_local_range"] = 0 <= first_row < local_tokens
+                if local_start is not None:
+                    row_for_shard_est = local_start + first_row
+                    info["first_non_finite_row_global_estimate"] = row_for_shard_est
+            elif local_start is not None:
+                local_end = local_start + local_tokens
+                info["local_row_begin"] = local_start
+                info["local_row_end_exclusive"] = local_end
+                info["first_non_finite_in_local_range"] = (
+                    local_start <= first_row < local_end
+                )
         rows_per_shard = _safe_int(info.get("rows_per_attn_dp_shard"))
-        if first_row is not None and rows_per_shard is not None and rows_per_shard > 0:
-            info["first_non_finite_est_attn_dp_shard"] = first_row // rows_per_shard
-            info["first_non_finite_row_in_est_shard"] = first_row % rows_per_shard
+        if (
+            row_for_shard_est is not None
+            and rows_per_shard is not None
+            and rows_per_shard > 0
+        ):
+            info["first_non_finite_est_attn_dp_shard"] = (
+                row_for_shard_est // rows_per_shard
+            )
+            info["first_non_finite_row_in_est_shard"] = (
+                row_for_shard_est % rows_per_shard
+            )
 
     if has_non_finite:
         logger.warning("NaNDiag anomaly: %s", info)

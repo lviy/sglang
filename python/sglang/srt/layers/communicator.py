@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_dp_local_info,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -86,6 +87,76 @@ elif _is_npu:
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
 # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
+
+def _diag_safe_scalar(value) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        if value.is_cuda:
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return None
+            except Exception:
+                return None
+        try:
+            return int(value.item())
+        except Exception:
+            return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _build_comm_dp_diag_extra(
+    forward_batch: ForwardBatch,
+    context: "CommunicateContext",
+    *,
+    tensor_rows: Optional[int] = None,
+) -> Dict[str, object]:
+    local_start_pos = None
+    local_num_tokens = None
+    try:
+        if (
+            context.attn_dp_size > 1
+            and getattr(forward_batch, "global_num_tokens_gpu", None) is not None
+        ):
+            local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    except Exception:
+        pass
+
+    global_rows = getattr(forward_batch, "global_dp_buffer_len", None)
+    if global_rows is None:
+        global_rows = tensor_rows
+    else:
+        global_rows = int(global_rows)
+
+    rows_per_attn_dp_shard = None
+    global_rows_mod_attn_dp_size = None
+    if (
+        global_rows is not None
+        and context.attn_dp_size is not None
+        and context.attn_dp_size > 0
+    ):
+        rows_per_attn_dp_shard = global_rows // context.attn_dp_size
+        global_rows_mod_attn_dp_size = global_rows % context.attn_dp_size
+
+    global_num_tokens_cpu = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if global_num_tokens_cpu is not None:
+        global_num_tokens_cpu = [int(x) for x in global_num_tokens_cpu]
+
+    return {
+        "dp_padding_mode": str(getattr(forward_batch, "dp_padding_mode", None)),
+        "local_start_pos": _diag_safe_scalar(local_start_pos),
+        "local_num_tokens": _diag_safe_scalar(local_num_tokens),
+        "global_rows": global_rows,
+        "rows_per_attn_dp_shard": rows_per_attn_dp_shard,
+        "global_rows_mod_attn_dp_size": global_rows_mod_attn_dp_size,
+        "global_num_tokens_cpu": global_num_tokens_cpu,
+    }
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
@@ -545,6 +616,11 @@ class LayerCommunicator:
     ):
         if cache is not None:
             self._context.cache = cache
+        dp_diag_extra = _build_comm_dp_diag_extra(
+            forward_batch,
+            self._context,
+            tensor_rows=int(hidden_states.shape[0]) if hidden_states.ndim > 0 else None,
+        )
 
         maybe_log_tensor_stats(
             "comm_prepare_mlp_input_hidden",
@@ -555,6 +631,7 @@ class LayerCommunicator:
                 "forward_mode": int(forward_batch.forward_mode),
                 "attn_tp_size": self._context.attn_tp_size,
                 "attn_dp_size": self._context.attn_dp_size,
+                **dp_diag_extra,
             },
         )
         if residual is not None:
@@ -567,6 +644,7 @@ class LayerCommunicator:
                     "forward_mode": int(forward_batch.forward_mode),
                     "attn_tp_size": self._context.attn_tp_size,
                     "attn_dp_size": self._context.attn_dp_size,
+                    **dp_diag_extra,
                 },
             )
 
@@ -586,6 +664,7 @@ class LayerCommunicator:
                 "forward_mode": int(forward_batch.forward_mode),
                 "attn_tp_size": self._context.attn_tp_size,
                 "attn_dp_size": self._context.attn_dp_size,
+                **dp_diag_extra,
             },
         )
         if residual is not None:
@@ -598,6 +677,7 @@ class LayerCommunicator:
                     "forward_mode": int(forward_batch.forward_mode),
                     "attn_tp_size": self._context.attn_tp_size,
                     "attn_dp_size": self._context.attn_dp_size,
+                    **dp_diag_extra,
                 },
             )
         return hidden_states, residual
@@ -897,6 +977,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
+        gather_diag_extra = _build_comm_dp_diag_extra(
+            forward_batch,
+            context,
+            tensor_rows=int(hidden_states.shape[0]) if hidden_states.ndim > 0 else None,
+        )
         maybe_log_tensor_stats(
             "comm_mlp_core_gather_entry_hidden",
             hidden_states,
@@ -907,6 +992,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 "residual_input_mode": str(residual_input_mode),
                 "attn_tp_size": context.attn_tp_size,
                 "attn_dp_size": context.attn_dp_size,
+                **gather_diag_extra,
             },
         )
         if residual is not None:
@@ -920,6 +1006,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     "residual_input_mode": str(residual_input_mode),
                     "attn_tp_size": context.attn_tp_size,
                     "attn_dp_size": context.attn_dp_size,
+                    **gather_diag_extra,
                 },
             )
         if get_attn_tp_context().input_scattered:
@@ -945,6 +1032,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     "forward_mode": int(forward_batch.forward_mode),
                     "attn_tp_size": context.attn_tp_size,
                     "attn_dp_size": context.attn_dp_size,
+                    **gather_diag_extra,
                 },
             )
         if context.attn_dp_size != 1:
@@ -965,6 +1053,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "attn_tp_size": context.attn_tp_size,
                         "attn_dp_size": context.attn_dp_size,
                         "layernorm_before_dp_gather": True,
+                        **gather_diag_extra,
                     },
                 )
                 with use_symmetric_memory(
@@ -982,6 +1071,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "attn_tp_size": context.attn_tp_size,
                         "attn_dp_size": context.attn_dp_size,
                         "layernorm_before_dp_gather": True,
+                        **gather_diag_extra,
                     },
                 )
 
@@ -999,6 +1089,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     "forward_mode": int(forward_batch.forward_mode),
                     "attn_tp_size": context.attn_tp_size,
                     "attn_dp_size": context.attn_dp_size,
+                    **gather_diag_extra,
                 },
             )
 
@@ -1013,6 +1104,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "forward_mode": int(forward_batch.forward_mode),
                         "attn_tp_size": context.attn_tp_size,
                         "attn_dp_size": context.attn_dp_size,
+                        **gather_diag_extra,
                     },
                 )
                 if hidden_states.shape[0] != 0:
@@ -1026,6 +1118,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                             "attn_tp_size": context.attn_tp_size,
                             "attn_dp_size": context.attn_dp_size,
                             "layernorm_before_dp_gather": False,
+                            **gather_diag_extra,
                         },
                     )
                     maybe_log_tensor_stats(
@@ -1038,6 +1131,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                             "attn_tp_size": context.attn_tp_size,
                             "attn_dp_size": context.attn_dp_size,
                             "layernorm_before_dp_gather": False,
+                            **gather_diag_extra,
                         },
                     )
                     hidden_states = layernorm(hidden_states)
@@ -1051,6 +1145,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                             "attn_tp_size": context.attn_tp_size,
                             "attn_dp_size": context.attn_dp_size,
                             "layernorm_before_dp_gather": False,
+                            **gather_diag_extra,
                         },
                     )
         else:
@@ -1067,6 +1162,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "attn_tp_size": context.attn_tp_size,
                         "attn_dp_size": context.attn_dp_size,
                         "use_allreduce_fusion": True,
+                        **gather_diag_extra,
                     },
                 )
                 if residual is not None:
@@ -1080,6 +1176,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                             "attn_tp_size": context.attn_tp_size,
                             "attn_dp_size": context.attn_dp_size,
                             "use_allreduce_fusion": True,
+                            **gather_diag_extra,
                         },
                     )
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
@@ -1095,6 +1192,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "attn_tp_size": context.attn_tp_size,
                         "attn_dp_size": context.attn_dp_size,
                         "use_allreduce_fusion": True,
+                        **gather_diag_extra,
                     },
                 )
                 if residual is not None:
@@ -1108,6 +1206,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                             "attn_tp_size": context.attn_tp_size,
                             "attn_dp_size": context.attn_dp_size,
                             "use_allreduce_fusion": True,
+                            **gather_diag_extra,
                         },
                     )
             else:
@@ -1121,6 +1220,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "forward_mode": int(forward_batch.forward_mode),
                         "attn_tp_size": context.attn_tp_size,
                         "attn_dp_size": context.attn_dp_size,
+                        **gather_diag_extra,
                     },
                 )
                 maybe_log_tensor_stats(
@@ -1133,6 +1233,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "attn_tp_size": context.attn_tp_size,
                         "attn_dp_size": context.attn_dp_size,
                         "use_allreduce_fusion": False,
+                        **gather_diag_extra,
                     },
                 )
                 if residual is not None:
@@ -1146,6 +1247,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                             "attn_tp_size": context.attn_tp_size,
                             "attn_dp_size": context.attn_dp_size,
                             "use_allreduce_fusion": False,
+                            **gather_diag_extra,
                         },
                     )
                 if _is_npu and context.cache is not None:
@@ -1161,6 +1263,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                         "attn_tp_size": context.attn_tp_size,
                         "attn_dp_size": context.attn_dp_size,
                         "use_allreduce_fusion": False,
+                        **gather_diag_extra,
                     },
                 )
                 if residual is not None:
@@ -1174,6 +1277,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                             "attn_tp_size": context.attn_tp_size,
                             "attn_dp_size": context.attn_dp_size,
                             "use_allreduce_fusion": False,
+                            **gather_diag_extra,
                         },
                     )
         maybe_log_tensor_stats(
@@ -1185,6 +1289,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 "forward_mode": int(forward_batch.forward_mode),
                 "attn_tp_size": context.attn_tp_size,
                 "attn_dp_size": context.attn_dp_size,
+                **gather_diag_extra,
             },
         )
         if residual is not None:
@@ -1197,6 +1302,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     "forward_mode": int(forward_batch.forward_mode),
                     "attn_tp_size": context.attn_tp_size,
                     "attn_dp_size": context.attn_dp_size,
+                    **gather_diag_extra,
                 },
             )
         return hidden_states, residual
