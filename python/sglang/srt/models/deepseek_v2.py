@@ -248,6 +248,12 @@ _NAN_DIAG_MLP_GUARD_PADDING = get_bool_env_var(
 _NAN_DIAG_SYNC_AFTER_SELF_ATTN_OUTPUT = get_bool_env_var(
     "SGLANG_NAN_DIAG_SYNC_AFTER_SELF_ATTN_OUTPUT", "false"
 )
+_NAN_DIAG_SELF_ATTN_OUTPUT_RACE_PROBE = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SELF_ATTN_OUTPUT_RACE_PROBE", "false"
+)
+_NAN_DIAG_SELF_ATTN_OUTPUT_RACE_PROBE_SYNC = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SELF_ATTN_OUTPUT_RACE_PROBE_SYNC", "false"
+)
 _NAN_DIAG_BOUNDARY_ROW_CHECK_ENABLE = get_bool_env_var(
     "SGLANG_NAN_DIAG_BOUNDARY_ROW_CHECK_ENABLE", "false"
 )
@@ -298,6 +304,21 @@ def _should_emit_deepseek_meta(stage: str, layer_id: int) -> bool:
     _NAN_DIAG_DEEPSEEK_META_SEEN_KEYS.add(key)
     _NAN_DIAG_DEEPSEEK_META_EVENT_COUNT += 1
     return True
+
+
+def _nan_diag_tensor_identity(tensor: Optional[torch.Tensor]) -> Dict[str, object]:
+    if not isinstance(tensor, torch.Tensor):
+        return {}
+    info: Dict[str, object] = {
+        "tensor_data_ptr": int(tensor.data_ptr()),
+        "tensor_storage_offset": int(tensor.storage_offset()),
+        "tensor_stride": tuple(int(x) for x in tensor.stride()),
+    }
+    try:
+        info["tensor_storage_data_ptr"] = int(tensor.untyped_storage().data_ptr())
+    except Exception:
+        pass
+    return info
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -2517,11 +2538,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             extra=attn_diag_extra,
         )
         output, _ = self.o_proj(attn_bmm_output)
+        o_proj_diag_extra = dict(attn_diag_extra)
+        o_proj_diag_extra.update(_nan_diag_tensor_identity(output))
         maybe_log_tensor_stats(
             "deepseek_attn_mla_post_o_proj",
             output,
             logger,
-            extra=attn_diag_extra,
+            extra=o_proj_diag_extra,
         )
 
         return output
@@ -2814,11 +2837,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             extra=attn_diag_extra,
         )
         output, _ = self.o_proj(attn_output)
+        o_proj_diag_extra = dict(attn_diag_extra)
+        o_proj_diag_extra.update(_nan_diag_tensor_identity(output))
         maybe_log_tensor_stats(
             "deepseek_attn_mla_post_o_proj",
             output,
             logger,
-            extra=attn_diag_extra,
+            extra=o_proj_diag_extra,
         )
 
         return output
@@ -2900,11 +2925,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             extra=attn_diag_extra,
         )
         output, _ = self.o_proj(attn_output)
+        o_proj_diag_extra = dict(attn_diag_extra)
+        o_proj_diag_extra.update(_nan_diag_tensor_identity(output))
         maybe_log_tensor_stats(
             "deepseek_attn_mla_post_o_proj",
             output,
             logger,
-            extra=attn_diag_extra,
+            extra=o_proj_diag_extra,
         )
 
         return output
@@ -3363,15 +3390,47 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
+        post_self_attn_diag_extra = {
+            "layer_id": self.layer_id,
+            "forward_mode": int(forward_batch.forward_mode),
+            "is_layer_sparse": bool(self.is_layer_sparse),
+            **_nan_diag_tensor_identity(hidden_states),
+        }
+        if _NAN_DIAG_SELF_ATTN_OUTPUT_RACE_PROBE:
+            pre_sync_has_non_finite = maybe_log_tensor_stats(
+                "deepseek_layer_hidden_post_self_attn_probe_pre_sync",
+                hidden_states,
+                logger,
+                extra=post_self_attn_diag_extra,
+            )
+            if _NAN_DIAG_SELF_ATTN_OUTPUT_RACE_PROBE_SYNC:
+                maybe_cuda_synchronize(
+                    True,
+                    "deepseek_layer_hidden_post_self_attn_probe_sync",
+                    logger,
+                    extra=post_self_attn_diag_extra,
+                )
+                post_sync_has_non_finite = maybe_log_tensor_stats(
+                    "deepseek_layer_hidden_post_self_attn_probe_post_sync",
+                    hidden_states,
+                    logger,
+                    extra=post_self_attn_diag_extra,
+                )
+                if (not pre_sync_has_non_finite) and post_sync_has_non_finite:
+                    maybe_log_event(
+                        "deepseek_layer_hidden_post_self_attn_probe_race_suspect",
+                        logger,
+                        extra={
+                            **post_self_attn_diag_extra,
+                            "probe_transition": "finite_to_non_finite_after_sync",
+                        },
+                        force=True,
+                    )
         maybe_cuda_synchronize(
             _NAN_DIAG_SYNC_AFTER_SELF_ATTN_OUTPUT,
             "deepseek_layer_hidden_post_self_attn_sync",
             logger,
-            extra={
-                "layer_id": self.layer_id,
-                "forward_mode": int(forward_batch.forward_mode),
-                "is_layer_sparse": bool(self.is_layer_sparse),
-            },
+            extra=post_self_attn_diag_extra,
         )
         self._nan_diag_check_prepare_mlp_boundary(
             hidden_states=hidden_states,
@@ -3383,11 +3442,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 "deepseek_layer_hidden_post_self_attn",
                 hidden_states,
                 logger,
-                extra={
-                    "layer_id": self.layer_id,
-                    "forward_mode": int(forward_batch.forward_mode),
-                    "is_layer_sparse": bool(self.is_layer_sparse),
-                },
+                extra=post_self_attn_diag_extra,
             )
             if post_self_attn_has_non_finite:
                 self.self_attn._log_mla_metadata_on_anomaly(
