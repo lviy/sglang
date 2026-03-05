@@ -47,7 +47,11 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.debug_utils.nan_diagnosis import maybe_log_event, maybe_log_tensor_stats
+from sglang.srt.debug_utils.nan_diagnosis import (
+    maybe_cuda_synchronize,
+    maybe_log_event,
+    maybe_log_tensor_stats,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -240,6 +244,18 @@ _NAN_DIAG_MLA_GUARD_PADDING = get_bool_env_var(
 )
 _NAN_DIAG_MLP_GUARD_PADDING = get_bool_env_var(
     "SGLANG_NAN_DIAG_MLP_GUARD_PADDING", "false"
+)
+_NAN_DIAG_SYNC_AFTER_SELF_ATTN_OUTPUT = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SYNC_AFTER_SELF_ATTN_OUTPUT", "false"
+)
+_NAN_DIAG_BOUNDARY_ROW_CHECK_ENABLE = get_bool_env_var(
+    "SGLANG_NAN_DIAG_BOUNDARY_ROW_CHECK_ENABLE", "false"
+)
+_NAN_DIAG_BOUNDARY_ROW_CHECK_ASSERT = get_bool_env_var(
+    "SGLANG_NAN_DIAG_BOUNDARY_ROW_CHECK_ASSERT", "false"
+)
+_NAN_DIAG_BOUNDARY_ROW_CHECK_MAX_ROWS = max(
+    1, int(os.getenv("SGLANG_NAN_DIAG_BOUNDARY_ROW_CHECK_MAX_ROWS", "8"))
 )
 _NAN_DIAG_DEEPSEEK_META_LOG_ONCE = get_bool_env_var(
     "SGLANG_NAN_DIAG_DEEPSEEK_META_LOG_ONCE", "true"
@@ -3021,6 +3037,220 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _build_boundary_row_trace(
+        self,
+        *,
+        row_idx: int,
+        reasons: list[str],
+        qo_indptr_cpu: Optional[torch.Tensor],
+        req_pool_indices_cpu: Optional[torch.Tensor],
+        out_cache_loc_cpu: Optional[torch.Tensor],
+        positions: Optional[torch.Tensor],
+    ) -> Dict[str, object]:
+        trace: Dict[str, object] = {
+            "row_idx": row_idx,
+            "reasons": reasons,
+        }
+
+        if qo_indptr_cpu is not None and qo_indptr_cpu.numel() >= 2:
+            row_tensor = torch.tensor([row_idx], dtype=qo_indptr_cpu.dtype)
+            req_idx = int(torch.searchsorted(qo_indptr_cpu, row_tensor, right=True).item()) - 1
+            trace["req_idx_from_qo_indptr"] = req_idx
+            if 0 <= req_idx < qo_indptr_cpu.numel() - 1:
+                q_begin = int(qo_indptr_cpu[req_idx].item())
+                q_end = int(qo_indptr_cpu[req_idx + 1].item())
+                trace["req_q_begin"] = q_begin
+                trace["req_q_end_exclusive"] = q_end
+                trace["row_in_req"] = row_idx - q_begin
+                if (
+                    req_pool_indices_cpu is not None
+                    and req_pool_indices_cpu.numel() > req_idx
+                ):
+                    trace["req_pool_idx"] = int(req_pool_indices_cpu[req_idx].item())
+
+        if (
+            out_cache_loc_cpu is not None
+            and out_cache_loc_cpu.ndim > 0
+            and 0 <= row_idx < int(out_cache_loc_cpu.shape[0])
+        ):
+            trace["out_cache_loc_value"] = int(out_cache_loc_cpu[row_idx].item())
+
+        if (
+            isinstance(positions, torch.Tensor)
+            and positions.ndim > 0
+            and 0 <= row_idx < int(positions.shape[0])
+        ):
+            trace["position"] = int(positions[row_idx].item())
+
+        return trace
+
+    def _nan_diag_check_prepare_mlp_boundary(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if not _NAN_DIAG_BOUNDARY_ROW_CHECK_ENABLE:
+            return
+        if hidden_states.ndim == 0:
+            return
+        if hidden_states.is_cuda:
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except Exception:
+                return
+
+        row_count = int(hidden_states.shape[0])
+        metadata = getattr(getattr(forward_batch, "attn_backend", None), "forward_metadata", None)
+        qo_indptr = None
+        if metadata is not None and not isinstance(metadata, (tuple, list)):
+            qo_indptr = self.self_attn._get_tensor_attr(
+                metadata, ["qo_indptr", "query_start_loc", "cu_seqlens_q"]
+            )
+
+        q_total_rows = None
+        qo_indptr_cpu = None
+        if isinstance(qo_indptr, torch.Tensor) and qo_indptr.numel() > 0:
+            q_total_rows = int(qo_indptr[-1].item())
+            qo_indptr_cpu = qo_indptr.detach().to("cpu")
+
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        out_cache_loc_rows = None
+        out_cache_loc_cpu = None
+        out_cache_zero_count = 0
+        out_cache_zero_non_tail_indices: list[int] = []
+        out_cache_zero_tail_begin = None
+        if isinstance(out_cache_loc, torch.Tensor) and out_cache_loc.ndim > 0:
+            out_cache_loc_rows = int(out_cache_loc.shape[0])
+            rows_for_mask = min(row_count, out_cache_loc_rows)
+            if rows_for_mask > 0:
+                out_cache_loc_cpu = out_cache_loc[:rows_for_mask].detach().to("cpu")
+                out_zero_cpu = out_cache_loc_cpu == 0
+                zero_indices = [
+                    int(x) for x in out_zero_cpu.nonzero(as_tuple=False).reshape(-1).tolist()
+                ]
+                out_cache_zero_count = len(zero_indices)
+                if out_cache_zero_count > 0 and bool(out_zero_cpu[-1].item()):
+                    idx = rows_for_mask - 1
+                    while idx >= 0 and bool(out_zero_cpu[idx].item()):
+                        idx -= 1
+                    out_cache_zero_tail_begin = idx + 1
+                if out_cache_zero_count > 0:
+                    if out_cache_zero_tail_begin is None:
+                        out_cache_zero_non_tail_indices = zero_indices[
+                            :_NAN_DIAG_BOUNDARY_ROW_CHECK_MAX_ROWS
+                        ]
+                    else:
+                        out_cache_zero_non_tail_indices = [
+                            row
+                            for row in zero_indices
+                            if row < out_cache_zero_tail_begin
+                        ][:_NAN_DIAG_BOUNDARY_ROW_CHECK_MAX_ROWS]
+
+        mismatch_reasons: list[str] = []
+        invalid_tail_candidates: list[tuple[int, str]] = []
+        if q_total_rows is not None and q_total_rows != row_count:
+            mismatch_reasons.append("row_count_vs_qo_indptr_mismatch")
+            if q_total_rows < row_count:
+                invalid_tail_candidates.append((q_total_rows, "tail_beyond_qo_indptr"))
+        if out_cache_loc_rows is not None and out_cache_loc_rows != row_count:
+            mismatch_reasons.append("row_count_vs_out_cache_loc_mismatch")
+            if out_cache_loc_rows < row_count:
+                invalid_tail_candidates.append(
+                    (out_cache_loc_rows, "tail_beyond_out_cache_loc")
+                )
+        if out_cache_zero_tail_begin is not None:
+            mismatch_reasons.append("tail_rows_marked_zero_in_out_cache_loc")
+            invalid_tail_candidates.append(
+                (out_cache_zero_tail_begin, "tail_zero_out_cache_loc")
+            )
+        if out_cache_zero_non_tail_indices:
+            mismatch_reasons.append("non_tail_zero_in_out_cache_loc")
+
+        if not mismatch_reasons:
+            return
+
+        req_pool_indices_cpu = None
+        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
+            req_pool_indices_cpu = forward_batch.req_pool_indices.detach().to("cpu")
+
+        invalid_tail_row_begin = None
+        invalid_tail_reasons: list[str] = []
+        if invalid_tail_candidates:
+            invalid_tail_row_begin = min(start for start, _ in invalid_tail_candidates)
+            invalid_tail_reasons = sorted(
+                {reason for _, reason in invalid_tail_candidates}
+            )
+
+        row_traces = []
+        if invalid_tail_row_begin is not None and invalid_tail_row_begin < row_count:
+            row_end = min(
+                row_count, invalid_tail_row_begin + _NAN_DIAG_BOUNDARY_ROW_CHECK_MAX_ROWS
+            )
+            for row_idx in range(invalid_tail_row_begin, row_end):
+                row_reasons = []
+                if q_total_rows is not None and row_idx >= q_total_rows:
+                    row_reasons.append("tail_beyond_qo_indptr")
+                if out_cache_loc_rows is not None and row_idx >= out_cache_loc_rows:
+                    row_reasons.append("tail_beyond_out_cache_loc")
+                if (
+                    out_cache_zero_tail_begin is not None
+                    and row_idx >= out_cache_zero_tail_begin
+                ):
+                    row_reasons.append("tail_zero_out_cache_loc")
+                row_traces.append(
+                    self._build_boundary_row_trace(
+                        row_idx=row_idx,
+                        reasons=row_reasons,
+                        qo_indptr_cpu=qo_indptr_cpu,
+                        req_pool_indices_cpu=req_pool_indices_cpu,
+                        out_cache_loc_cpu=out_cache_loc_cpu,
+                        positions=positions,
+                    )
+                )
+        elif out_cache_zero_non_tail_indices:
+            for row_idx in out_cache_zero_non_tail_indices:
+                row_traces.append(
+                    self._build_boundary_row_trace(
+                        row_idx=row_idx,
+                        reasons=["non_tail_zero_out_cache_loc"],
+                        qo_indptr_cpu=qo_indptr_cpu,
+                        req_pool_indices_cpu=req_pool_indices_cpu,
+                        out_cache_loc_cpu=out_cache_loc_cpu,
+                        positions=positions,
+                    )
+                )
+
+        maybe_log_event(
+            "deepseek_layer_hidden_pre_prepare_mlp_boundary_mismatch",
+            logger,
+            extra={
+                "layer_id": self.layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "row_count": row_count,
+                "q_total_rows_from_qo_indptr": q_total_rows,
+                "out_cache_loc_rows": out_cache_loc_rows,
+                "mismatch_reasons": mismatch_reasons,
+                "invalid_tail_row_begin": invalid_tail_row_begin,
+                "invalid_tail_row_count": (
+                    row_count - invalid_tail_row_begin
+                    if invalid_tail_row_begin is not None
+                    else 0
+                ),
+                "invalid_tail_reasons": invalid_tail_reasons,
+                "out_cache_zero_count": out_cache_zero_count,
+                "out_cache_zero_non_tail_indices": out_cache_zero_non_tail_indices,
+                "row_trace_sample": row_traces,
+            },
+            force=True,
+        )
+        if _NAN_DIAG_BOUNDARY_ROW_CHECK_ASSERT:
+            raise RuntimeError(
+                f"NaNDiag boundary mismatch in layer {self.layer_id}: {mismatch_reasons}"
+            )
+
     def _sanitize_pre_mlp_padding_rows(
         self,
         hidden_states: torch.Tensor,
@@ -3132,6 +3362,21 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
+        )
+        maybe_cuda_synchronize(
+            _NAN_DIAG_SYNC_AFTER_SELF_ATTN_OUTPUT,
+            "deepseek_layer_hidden_post_self_attn_sync",
+            logger,
+            extra={
+                "layer_id": self.layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "is_layer_sparse": bool(self.is_layer_sparse),
+            },
+        )
+        self._nan_diag_check_prepare_mlp_boundary(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
         )
         if _should_log_deepseek_block_layer(self.layer_id):
             post_self_attn_has_non_finite = maybe_log_tensor_stats(

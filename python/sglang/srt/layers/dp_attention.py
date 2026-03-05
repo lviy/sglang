@@ -10,7 +10,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
+from sglang.srt.debug_utils.nan_diagnosis import (
+    maybe_cuda_synchronize,
+    maybe_log_tensor_stats,
+)
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_tensor_model_parallel_rank,
@@ -43,6 +46,15 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_NAN_DIAG_DP_GATHER_GUARD_PADDING = get_bool_env_var(
+    "SGLANG_NAN_DIAG_DP_GATHER_GUARD_PADDING", "false"
+)
+_NAN_DIAG_SYNC_DP_GATHER_ALLREDUCE_PRE = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SYNC_DP_GATHER_ALLREDUCE_PRE", "false"
+)
+_NAN_DIAG_SYNC_DP_GATHER_ALLREDUCE_POST = get_bool_env_var(
+    "SGLANG_NAN_DIAG_SYNC_DP_GATHER_ALLREDUCE_POST", "false"
+)
 
 
 class DpPaddingMode(IntEnum):
@@ -543,6 +555,12 @@ def _dp_gather_via_all_reduce(
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
+    maybe_cuda_synchronize(
+        _NAN_DIAG_SYNC_DP_GATHER_ALLREDUCE_PRE,
+        "dp_gather_allreduce_pre_collective_sync",
+        logger,
+        extra=base_extra,
+    )
     if (
         not local_tokens.dtype.is_floating_point
         and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
@@ -553,6 +571,12 @@ def _dp_gather_via_all_reduce(
 
     else:
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+    maybe_cuda_synchronize(
+        _NAN_DIAG_SYNC_DP_GATHER_ALLREDUCE_POST,
+        "dp_gather_allreduce_post_collective_sync",
+        logger,
+        extra=base_extra,
+    )
     maybe_log_tensor_stats(
         "dp_gather_allreduce_after_collective_global",
         global_tokens,
@@ -583,6 +607,26 @@ def _dp_gather_via_all_gather(
         logger,
         extra=base_extra,
     )
+    # In MAX_LEN mode, local_tokens can carry tail padding rows. Guarding here helps
+    # verify whether stale padding rows are the source of cross-shard NaN propagation.
+    if _NAN_DIAG_DP_GATHER_GUARD_PADDING:
+        local_num_tokens_i = _diag_safe_scalar(local_num_tokens)
+        if (
+            local_num_tokens_i is not None
+            and local_tokens.ndim > 0
+            and local_tokens.shape[0] > local_num_tokens_i >= 0
+        ):
+            local_tokens[local_num_tokens_i:].fill_(0)
+            maybe_log_tensor_stats(
+                "dp_gather_allgather_after_guard_padding_local",
+                local_tokens,
+                logger,
+                extra={
+                    **base_extra,
+                    "guard_enabled": True,
+                    "guard_local_num_tokens": local_num_tokens_i,
+                },
+            )
 
     if get_attention_tp_size() == 1:
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)

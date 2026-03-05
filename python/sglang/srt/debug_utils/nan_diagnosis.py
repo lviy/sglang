@@ -189,6 +189,34 @@ def maybe_log_invariant(
     return False
 
 
+def maybe_cuda_synchronize(
+    enabled: bool,
+    stage: str,
+    logger: logging.Logger,
+    extra: Optional[Dict[str, object]] = None,
+) -> bool:
+    """Conditionally synchronize CUDA for race diagnosis."""
+    if not enabled or not torch.cuda.is_available():
+        return False
+    if _is_stream_capturing():
+        maybe_log_event(
+            stage,
+            logger,
+            extra={**(extra or {}), "sync_skipped_stream_capturing": True},
+            force=True,
+        )
+        return False
+
+    torch.cuda.synchronize()
+    maybe_log_event(
+        stage,
+        logger,
+        extra={**(extra or {}), "cuda_synchronized": True},
+        force=True,
+    )
+    return True
+
+
 def _tensor_stats(tensor: torch.Tensor) -> Dict[str, object]:
     data = tensor.detach()
     finite_mask = torch.isfinite(data)
