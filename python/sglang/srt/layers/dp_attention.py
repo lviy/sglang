@@ -10,7 +10,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
+from sglang.srt.debug_utils.nan_diagnosis import (
+    maybe_log_event,
+    maybe_log_tensor_stats,
+)
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_tensor_model_parallel_rank,
@@ -51,6 +54,12 @@ _NAN_DIAG_SYNC_BEFORE_DP_GATHER = get_bool_env_var(
 )
 _NAN_DIAG_SYNC_AFTER_DP_GATHER = get_bool_env_var(
     "SGLANG_NAN_DIAG_SYNC_AFTER_DP_GATHER", "false"
+)
+_NAN_DIAG_ASSERT_DP_COPY_BOUNDS = get_bool_env_var(
+    "SGLANG_NAN_DIAG_ASSERT_DP_COPY_BOUNDS", "false"
+)
+_NAN_DIAG_FORCE_NO_ALIAS_REDUCE_SCATTER = get_bool_env_var(
+    "SGLANG_NAN_DIAG_FORCE_NO_ALIAS_REDUCE_SCATTER", "false"
 )
 
 
@@ -519,6 +528,57 @@ def _maybe_nan_diag_cuda_sync(enabled: bool) -> None:
     torch.cuda.synchronize()
 
 
+def _check_dp_copy_bounds(
+    *,
+    stage: str,
+    forward_batch: ForwardBatch,
+    src_rows: int,
+    dst_rows: int,
+    local_start_pos: Optional[torch.Tensor],
+    local_num_tokens: Optional[torch.Tensor],
+    offset_src: bool,
+) -> None:
+    if not _NAN_DIAG_ASSERT_DP_COPY_BOUNDS:
+        return
+
+    local_start_pos_i = _diag_safe_scalar(local_start_pos)
+    local_num_tokens_i = _diag_safe_scalar(local_num_tokens)
+    if local_start_pos_i is None or local_num_tokens_i is None:
+        return
+
+    src_required_rows = local_start_pos_i + local_num_tokens_i if offset_src else local_num_tokens_i
+    dst_required_rows = local_num_tokens_i if offset_src else local_start_pos_i + local_num_tokens_i
+    ok = (
+        local_start_pos_i >= 0
+        and local_num_tokens_i >= 0
+        and src_required_rows <= src_rows
+        and dst_required_rows <= dst_rows
+    )
+    if ok:
+        return
+
+    extra = {
+        "forward_mode": int(forward_batch.forward_mode),
+        "stage": stage,
+        "offset_src": bool(offset_src),
+        "src_rows": int(src_rows),
+        "dst_rows": int(dst_rows),
+        "local_start_pos": local_start_pos_i,
+        "local_num_tokens": local_num_tokens_i,
+        "src_required_rows": int(src_required_rows),
+        "dst_required_rows": int(dst_required_rows),
+        "attn_tp_rank": get_attention_tp_rank(),
+        "attn_tp_size": get_attention_tp_size(),
+        "attn_dp_rank": get_attention_dp_rank(),
+        "attn_dp_size": get_attention_dp_size(),
+        "tp_rank": get_tensor_model_parallel_rank(),
+        "tp_size": get_tensor_model_parallel_world_size(),
+        "dp_padding_mode": str(getattr(forward_batch, "dp_padding_mode", None)),
+    }
+    maybe_log_event(stage, logger, extra=extra, force=True)
+    raise RuntimeError(f"NaNDiag DP copy bounds violation: {extra}")
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -546,6 +606,15 @@ def _dp_gather_via_all_reduce(
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
+    _check_dp_copy_bounds(
+        stage="dp_gather_allreduce_copy_bounds",
+        forward_batch=forward_batch,
+        src_rows=int(local_tokens.shape[0]),
+        dst_rows=int(global_tokens.shape[0]),
+        local_start_pos=local_start_pos,
+        local_num_tokens=local_num_tokens,
+        offset_src=False,
+    )
 
     if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
         assert (
@@ -652,17 +721,25 @@ def _dp_gather_via_all_gather(
                 logger,
                 extra={**base_extra, "row_index_space": "local"},
             )
-    scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
+    scattered_local_tokens_view = local_tokens.tensor_split(get_attention_tp_size())[
         get_attention_tp_rank()
     ]
+    scattered_local_tokens = scattered_local_tokens_view
+    if _NAN_DIAG_FORCE_NO_ALIAS_REDUCE_SCATTER:
+        scattered_local_tokens = torch.empty_like(scattered_local_tokens_view)
     maybe_log_tensor_stats(
         "dp_gather_allgather_after_tensor_split_local",
-        scattered_local_tokens,
+        scattered_local_tokens_view,
         logger,
         extra={
             **base_extra,
             "row_index_space": "local",
             "split_alias_local": (
+                scattered_local_tokens_view.untyped_storage()
+                is local_tokens.untyped_storage()
+            ),
+            "reduce_scatter_no_alias": bool(_NAN_DIAG_FORCE_NO_ALIAS_REDUCE_SCATTER),
+            "reduce_scatter_output_alias_input": (
                 scattered_local_tokens.untyped_storage() is local_tokens.untyped_storage()
             ),
         },
@@ -728,6 +805,15 @@ def dp_scatter(
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
+    _check_dp_copy_bounds(
+        stage="dp_scatter_copy_bounds",
+        forward_batch=forward_batch,
+        src_rows=int(global_tokens.shape[0]),
+        dst_rows=int(local_tokens.shape[0]),
+        local_start_pos=local_start_pos,
+        local_num_tokens=local_num_tokens,
+        offset_src=True,
+    )
     if local_tokens.shape[0] > 0:
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
@@ -742,9 +828,12 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
-        scattered_local_tokens = input.tensor_split(
+        scattered_local_tokens_view = input.tensor_split(
             get_tensor_model_parallel_world_size()
         )[get_tensor_model_parallel_rank()]
+        scattered_local_tokens = scattered_local_tokens_view
+        if _NAN_DIAG_FORCE_NO_ALIAS_REDUCE_SCATTER:
+            scattered_local_tokens = torch.empty_like(scattered_local_tokens_view)
         get_tp_group().reduce_scatter_tensor(scattered_local_tokens, input)
         get_attention_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
 
