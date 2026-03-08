@@ -268,15 +268,14 @@ def _resolve_tail_row_index(
     return row_index
 
 
-def _row_stats(tensor: torch.Tensor, row_index: int) -> Dict[str, object]:
+def _row_non_finite_stats(tensor: torch.Tensor, row_index: int) -> Dict[str, object]:
     data = tensor.detach()
     row = data[row_index].reshape(-1)
     finite_mask = torch.isfinite(row)
-    finite_count = int(finite_mask.sum().item())
     total_count = row.numel()
-    non_finite_count = total_count - finite_count
-    isnan = False
-    isinf = False
+    non_finite_mask = ~finite_mask
+    non_finite_count = int(non_finite_mask.sum().item())
+    has_non_finite = non_finite_count > 0
 
     stats = {
         "shape": tuple(data.shape),
@@ -284,39 +283,21 @@ def _row_stats(tensor: torch.Tensor, row_index: int) -> Dict[str, object]:
         "device": str(data.device),
         "probe_kind": "tail_row",
         "probe_row_index": int(row_index),
-        "probe_row_shape": tuple(data[row_index].shape),
         "probe_row_total_count": total_count,
         "probe_row_non_finite_count": non_finite_count,
-        "probe_row_finite_count": finite_count,
-        "probe_row_isnan": False,
-        "probe_row_isinf": False,
+        "probe_row_has_non_finite": has_non_finite,
     }
 
-    if non_finite_count > 0:
+    if has_non_finite:
         nan_mask = torch.isnan(row)
         inf_mask = torch.isinf(row)
-        isnan = bool(nan_mask.any().item())
-        isinf = bool(inf_mask.any().item())
-        non_finite_mask = ~finite_mask
-        stats["probe_row_isnan"] = isnan
-        stats["probe_row_isinf"] = isinf
+        stats["probe_row_isnan"] = bool(nan_mask.any().item())
+        stats["probe_row_isinf"] = bool(inf_mask.any().item())
         stats["probe_row_nan_count"] = int(nan_mask.sum().item())
         stats["probe_row_inf_count"] = int(inf_mask.sum().item())
         stats["probe_row_first_non_finite_col"] = int(
             non_finite_mask.nonzero()[0].item()
         )
-
-    if finite_count > 0:
-        finite_row = row[finite_mask]
-        stats["probe_row_min"] = float(finite_row.min().item())
-        stats["probe_row_max"] = float(finite_row.max().item())
-        stats["probe_row_mean"] = float(finite_row.float().mean().item())
-        stats["probe_row_std"] = float(finite_row.float().std(unbiased=False).item())
-    else:
-        stats["probe_row_min"] = None
-        stats["probe_row_max"] = None
-        stats["probe_row_mean"] = None
-        stats["probe_row_std"] = None
 
     return stats
 
@@ -474,24 +455,18 @@ def maybe_log_tail_row_probe(
         return False
 
     call_index = _next_stage_call_index(stage)
-    stats = _row_stats(tensor, row_index)
-    has_non_finite = stats["probe_row_isnan"] or stats["probe_row_isinf"]
-    anomaly_index = _next_stage_anomaly_index(stage) if has_non_finite else None
-    should_log = has_non_finite or _LOG_ALL
-    if not should_log:
+    stats = _row_non_finite_stats(tensor, row_index)
+    has_non_finite = bool(stats["probe_row_has_non_finite"])
+    if not has_non_finite:
         return False
+    anomaly_index = _next_stage_anomaly_index(stage)
     if has_non_finite and (anomaly_index - 1) % _ANOMALY_LOG_EVERY != 0:
         return True
-    if has_non_finite:
-        if _GLOBAL_ANOMALY_LOG_COUNT >= _MAX_ANOMALY_LOGS:
-            return True
-        stage_anomaly_log_count = _STAGE_ANOMALY_LOG_COUNTER.get(stage, 0)
-        if stage_anomaly_log_count >= _MAX_ANOMALY_LOGS_PER_STAGE:
-            return True
-    if not has_non_finite and call_index % _LOG_EVERY != 0:
-        return False
-    if _GLOBAL_LOG_COUNT >= _MAX_LOGS and not has_non_finite:
-        return has_non_finite
+    if _GLOBAL_ANOMALY_LOG_COUNT >= _MAX_ANOMALY_LOGS:
+        return True
+    stage_anomaly_log_count = _STAGE_ANOMALY_LOG_COUNTER.get(stage, 0)
+    if stage_anomaly_log_count >= _MAX_ANOMALY_LOGS_PER_STAGE:
+        return True
 
     rank = _get_rank()
     info = {
@@ -517,15 +492,10 @@ def maybe_log_tail_row_probe(
             info["probe_row_est_attn_dp_shard"] = global_row // rows_per_shard
             info["probe_row_in_est_shard"] = global_row % rows_per_shard
 
-    if has_non_finite:
-        logger.warning("NaNDiag anomaly: %s", info)
-        _GLOBAL_ANOMALY_LOG_COUNT += 1
-        _STAGE_ANOMALY_LOG_COUNTER[stage] = (
-            _STAGE_ANOMALY_LOG_COUNTER.get(stage, 0) + 1
-        )
-        _dump_tensor(stage, tensor.detach().narrow(0, row_index, 1), extra)
-    else:
-        logger.info("NaNDiag row stats: %s", info)
-
+    logger.warning("NaNDiag anomaly: %s", info)
+    _GLOBAL_ANOMALY_LOG_COUNT += 1
+    _STAGE_ANOMALY_LOG_COUNTER[stage] = (
+        _STAGE_ANOMALY_LOG_COUNTER.get(stage, 0) + 1
+    )
     _GLOBAL_LOG_COUNT += 1
     return has_non_finite
