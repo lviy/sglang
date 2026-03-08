@@ -47,7 +47,11 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.debug_utils.nan_diagnosis import maybe_log_event, maybe_log_tensor_stats
+from sglang.srt.debug_utils.nan_diagnosis import (
+    maybe_log_event,
+    maybe_log_tail_row_probe,
+    maybe_log_tensor_stats,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -288,6 +292,49 @@ def _should_emit_deepseek_meta(stage: str, layer_id: int) -> bool:
     _NAN_DIAG_DEEPSEEK_META_SEEN_KEYS.add(key)
     _NAN_DIAG_DEEPSEEK_META_EVENT_COUNT += 1
     return True
+
+
+def _build_tail_row_diag_extra(
+    forward_batch: ForwardBatch,
+    *,
+    tensor_rows: Optional[int] = None,
+) -> Dict[str, object]:
+    global_num_tokens_cpu = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if global_num_tokens_cpu is not None:
+        try:
+            global_num_tokens_cpu = [int(x) for x in global_num_tokens_cpu]
+        except Exception:
+            global_num_tokens_cpu = None
+
+    local_start_pos = None
+    local_num_tokens = None
+    global_rows = tensor_rows
+    rows_per_attn_dp_shard = None
+    global_rows_mod_attn_dp_size = None
+
+    if (
+        is_dp_attention_enabled()
+        and global_num_tokens_cpu is not None
+        and len(global_num_tokens_cpu) > 0
+    ):
+        dp_rank = get_attention_dp_rank()
+        if 0 <= dp_rank < len(global_num_tokens_cpu):
+            local_num_tokens = int(global_num_tokens_cpu[dp_rank])
+            local_start_pos = sum(global_num_tokens_cpu[:dp_rank])
+        global_rows = sum(global_num_tokens_cpu)
+        attn_dp_size = get_attention_dp_size()
+        if attn_dp_size > 0:
+            rows_per_attn_dp_shard = global_rows // attn_dp_size
+            global_rows_mod_attn_dp_size = global_rows % attn_dp_size
+
+    return {
+        "local_start_pos": local_start_pos,
+        "local_num_tokens": local_num_tokens,
+        "global_rows": global_rows,
+        "rows_per_attn_dp_shard": rows_per_attn_dp_shard,
+        "global_rows_mod_attn_dp_size": global_rows_mod_attn_dp_size,
+        "global_num_tokens_cpu": global_num_tokens_cpu,
+    }
 
 
 def _maybe_nan_diag_cuda_sync(enabled: bool) -> None:
@@ -3151,6 +3198,24 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
         )
         _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_AFTER_SELF_ATTN)
+        deepseek_tail_diag_extra = None
+        if _should_log_deepseek_block_layer(self.layer_id) and is_dp_attention_enabled():
+            deepseek_tail_diag_extra = _build_tail_row_diag_extra(
+                forward_batch,
+                tensor_rows=int(hidden_states.shape[0]) if hidden_states.ndim > 0 else None,
+            )
+            maybe_log_tail_row_probe(
+                "tail_probe_deepseek_post_self_attn_hidden",
+                hidden_states,
+                logger,
+                local_num_tokens=deepseek_tail_diag_extra.get("local_num_tokens"),
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                    **deepseek_tail_diag_extra,
+                },
+            )
         if _should_log_deepseek_block_layer(self.layer_id):
             post_self_attn_has_non_finite = maybe_log_tensor_stats(
                 "deepseek_layer_hidden_post_self_attn",
@@ -3175,6 +3240,26 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
 
         if _should_log_deepseek_block_layer(self.layer_id):
+            if is_dp_attention_enabled():
+                if deepseek_tail_diag_extra is None:
+                    deepseek_tail_diag_extra = _build_tail_row_diag_extra(
+                        forward_batch,
+                        tensor_rows=(
+                            int(hidden_states.shape[0]) if hidden_states.ndim > 0 else None
+                        ),
+                    )
+                maybe_log_tail_row_probe(
+                    "tail_probe_deepseek_pre_prepare_mlp_hidden",
+                    hidden_states,
+                    logger,
+                    local_num_tokens=deepseek_tail_diag_extra.get("local_num_tokens"),
+                    extra={
+                        "layer_id": self.layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "is_layer_sparse": bool(self.is_layer_sparse),
+                        **deepseek_tail_diag_extra,
+                    },
+                )
             pre_prepare_mlp_has_non_finite = maybe_log_tensor_stats(
                 "deepseek_layer_hidden_pre_prepare_mlp",
                 hidden_states,
@@ -3186,6 +3271,27 @@ class DeepseekV2DecoderLayer(nn.Module):
                 },
             )
             if residual is not None:
+                if is_dp_attention_enabled():
+                    maybe_log_tail_row_probe(
+                        "tail_probe_deepseek_pre_prepare_mlp_residual",
+                        residual,
+                        logger,
+                        local_num_tokens=(
+                            deepseek_tail_diag_extra.get("local_num_tokens")
+                            if deepseek_tail_diag_extra is not None
+                            else None
+                        ),
+                        extra={
+                            "layer_id": self.layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "is_layer_sparse": bool(self.is_layer_sparse),
+                            **(
+                                deepseek_tail_diag_extra
+                                if deepseek_tail_diag_extra is not None
+                                else {}
+                            ),
+                        },
+                    )
                 maybe_log_tensor_stats(
                     "deepseek_layer_residual_pre_prepare_mlp",
                     residual,

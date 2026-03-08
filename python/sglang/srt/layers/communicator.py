@@ -29,7 +29,10 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.debug_utils.nan_diagnosis import maybe_log_tensor_stats
+from sglang.srt.debug_utils.nan_diagnosis import (
+    maybe_log_tail_row_probe,
+    maybe_log_tensor_stats,
+)
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
@@ -634,6 +637,20 @@ class LayerCommunicator:
                 **dp_diag_extra,
             },
         )
+        if self._context.attn_dp_size > 1:
+            maybe_log_tail_row_probe(
+                "tail_probe_comm_prepare_mlp_input_hidden",
+                hidden_states,
+                logger,
+                local_num_tokens=dp_diag_extra.get("local_num_tokens"),
+                extra={
+                    "layer_id": self._context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": self._context.attn_tp_size,
+                    "attn_dp_size": self._context.attn_dp_size,
+                    **dp_diag_extra,
+                },
+            )
         if residual is not None:
             maybe_log_tensor_stats(
                 "comm_prepare_mlp_input_residual",
@@ -647,6 +664,20 @@ class LayerCommunicator:
                     **dp_diag_extra,
                 },
             )
+            if self._context.attn_dp_size > 1:
+                maybe_log_tail_row_probe(
+                    "tail_probe_comm_prepare_mlp_input_residual",
+                    residual,
+                    logger,
+                    local_num_tokens=dp_diag_extra.get("local_num_tokens"),
+                    extra={
+                        "layer_id": self._context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": self._context.attn_tp_size,
+                        "attn_dp_size": self._context.attn_dp_size,
+                        **dp_diag_extra,
+                    },
+                )
 
         hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
