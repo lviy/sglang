@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.debug_utils.nan_diagnosis import (
     maybe_log_tail_row_probe,
+    maybe_log_tensor_metadata_probe,
     maybe_log_tensor_stats,
 )
 from sglang.srt.layers.attention.nsa.utils import (
@@ -624,6 +625,20 @@ class LayerCommunicator:
             self._context,
             tensor_rows=int(hidden_states.shape[0]) if hidden_states.ndim > 0 else None,
         )
+        if self._context.attn_dp_size > 1:
+            maybe_log_tensor_metadata_probe(
+                "meta_probe_comm_prepare_mlp_input_hidden",
+                hidden_states,
+                logger,
+                peer=residual,
+                extra={
+                    "layer_id": self._context.diag_layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "attn_tp_size": self._context.attn_tp_size,
+                    "attn_dp_size": self._context.attn_dp_size,
+                    **dp_diag_extra,
+                },
+            )
 
         maybe_log_tensor_stats(
             "comm_prepare_mlp_input_hidden",
@@ -650,8 +665,22 @@ class LayerCommunicator:
                     "attn_dp_size": self._context.attn_dp_size,
                     **dp_diag_extra,
                 },
-            )
+        )
         if residual is not None:
+            if self._context.attn_dp_size > 1:
+                maybe_log_tensor_metadata_probe(
+                    "meta_probe_comm_prepare_mlp_input_residual",
+                    residual,
+                    logger,
+                    peer=hidden_states,
+                    extra={
+                        "layer_id": self._context.diag_layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "attn_tp_size": self._context.attn_tp_size,
+                        "attn_dp_size": self._context.attn_dp_size,
+                        **dp_diag_extra,
+                    },
+                )
             maybe_log_tensor_stats(
                 "comm_prepare_mlp_input_residual",
                 residual,

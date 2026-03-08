@@ -302,6 +302,47 @@ def _row_non_finite_stats(tensor: torch.Tensor, row_index: int) -> Dict[str, obj
     return stats
 
 
+def _safe_data_ptr(tensor: torch.Tensor) -> Optional[int]:
+    try:
+        return int(tensor.data_ptr())
+    except Exception:
+        return None
+
+
+def _safe_storage_data_ptr(tensor: torch.Tensor) -> Optional[int]:
+    try:
+        return int(tensor.untyped_storage().data_ptr())
+    except Exception:
+        return None
+
+
+def _safe_storage_nbytes(tensor: torch.Tensor) -> Optional[int]:
+    try:
+        return int(tensor.untyped_storage().nbytes())
+    except Exception:
+        return None
+
+
+def _tensor_metadata(tensor: torch.Tensor) -> Dict[str, object]:
+    data = tensor.detach()
+    metadata = {
+        "shape": tuple(data.shape),
+        "dtype": str(data.dtype),
+        "device": str(data.device),
+        "layout": str(data.layout),
+        "stride": tuple(int(x) for x in data.stride()),
+        "storage_offset": int(data.storage_offset()),
+        "is_contiguous": bool(data.is_contiguous()),
+        "numel": int(data.numel()),
+        "element_size": int(data.element_size()),
+        "data_ptr": _safe_data_ptr(data),
+        "storage_data_ptr": _safe_storage_data_ptr(data),
+        "storage_nbytes": _safe_storage_nbytes(data),
+        "has_base": getattr(data, "_base", None) is not None,
+    }
+    return metadata
+
+
 def _dump_tensor(
     stage: str,
     tensor: torch.Tensor,
@@ -499,3 +540,65 @@ def maybe_log_tail_row_probe(
     )
     _GLOBAL_LOG_COUNT += 1
     return has_non_finite
+
+
+def maybe_log_tensor_metadata_probe(
+    stage: str,
+    tensor: Optional[torch.Tensor],
+    logger: logging.Logger,
+    *,
+    peer: Optional[torch.Tensor] = None,
+    extra: Optional[Dict[str, object]] = None,
+) -> bool:
+    global _GLOBAL_LOG_COUNT
+
+    if not _ENABLED or tensor is None or not isinstance(tensor, torch.Tensor):
+        return False
+    if not _is_rank_enabled():
+        return False
+    if not _is_stage_enabled(stage):
+        return False
+    if _GLOBAL_LOG_COUNT >= _MAX_LOGS:
+        return False
+
+    call_index = _next_stage_call_index(stage)
+    if call_index % _LOG_EVERY != 0:
+        return False
+
+    info = {
+        "stage": stage,
+        "rank": _get_rank(),
+        "call_index": call_index,
+        "probe_kind": "metadata_only",
+        **_tensor_metadata(tensor),
+    }
+
+    if peer is not None and isinstance(peer, torch.Tensor):
+        peer_metadata = _tensor_metadata(peer)
+        info.update(
+            {
+                "peer_shape": peer_metadata["shape"],
+                "peer_stride": peer_metadata["stride"],
+                "peer_storage_offset": peer_metadata["storage_offset"],
+                "peer_data_ptr": peer_metadata["data_ptr"],
+                "peer_storage_data_ptr": peer_metadata["storage_data_ptr"],
+                "peer_storage_nbytes": peer_metadata["storage_nbytes"],
+                "peer_has_base": peer_metadata["has_base"],
+                "same_tensor_object_as_peer": tensor is peer,
+                "same_data_ptr_as_peer": (
+                    info["data_ptr"] is not None
+                    and info["data_ptr"] == peer_metadata["data_ptr"]
+                ),
+                "same_storage_as_peer": (
+                    info["storage_data_ptr"] is not None
+                    and info["storage_data_ptr"] == peer_metadata["storage_data_ptr"]
+                ),
+            }
+        )
+
+    if extra:
+        info.update(extra)
+
+    logger.info("NaNDiag metadata: %s", info)
+    _GLOBAL_LOG_COUNT += 1
+    return True

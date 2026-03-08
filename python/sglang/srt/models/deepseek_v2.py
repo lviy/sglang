@@ -50,6 +50,7 @@ from sglang.srt.distributed import (
 from sglang.srt.debug_utils.nan_diagnosis import (
     maybe_log_event,
     maybe_log_tail_row_probe,
+    maybe_log_tensor_metadata_probe,
     maybe_log_tensor_stats,
 )
 from sglang.srt.environ import envs
@@ -3167,6 +3168,30 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch,
             quant_format,
         )
+        if _should_log_deepseek_block_layer(self.layer_id) and is_dp_attention_enabled():
+            maybe_log_tensor_metadata_probe(
+                "meta_probe_deepseek_post_prepare_attn_hidden",
+                hidden_states,
+                logger,
+                peer=residual,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                },
+            )
+            if residual is not None:
+                maybe_log_tensor_metadata_probe(
+                    "meta_probe_deepseek_post_prepare_attn_residual",
+                    residual,
+                    logger,
+                    peer=hidden_states,
+                    extra={
+                        "layer_id": self.layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "is_layer_sparse": bool(self.is_layer_sparse),
+                    },
+                )
         if _should_log_deepseek_block_layer(self.layer_id):
             maybe_log_tensor_stats(
                 "deepseek_layer_hidden_post_prepare_attn",
@@ -3200,6 +3225,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_AFTER_SELF_ATTN)
         deepseek_tail_diag_extra = None
         if _should_log_deepseek_block_layer(self.layer_id) and is_dp_attention_enabled():
+            maybe_log_tensor_metadata_probe(
+                "meta_probe_deepseek_post_self_attn_hidden",
+                hidden_states,
+                logger,
+                peer=residual,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "is_layer_sparse": bool(self.is_layer_sparse),
+                },
+            )
             deepseek_tail_diag_extra = _build_tail_row_diag_extra(
                 forward_batch,
                 tensor_rows=int(hidden_states.shape[0]) if hidden_states.ndim > 0 else None,
@@ -3241,6 +3277,17 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if _should_log_deepseek_block_layer(self.layer_id):
             if is_dp_attention_enabled():
+                maybe_log_tensor_metadata_probe(
+                    "meta_probe_deepseek_pre_prepare_mlp_hidden",
+                    hidden_states,
+                    logger,
+                    peer=residual,
+                    extra={
+                        "layer_id": self.layer_id,
+                        "forward_mode": int(forward_batch.forward_mode),
+                        "is_layer_sparse": bool(self.is_layer_sparse),
+                    },
+                )
                 if deepseek_tail_diag_extra is None:
                     deepseek_tail_diag_extra = _build_tail_row_diag_extra(
                         forward_batch,
@@ -3272,6 +3319,17 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
             if residual is not None:
                 if is_dp_attention_enabled():
+                    maybe_log_tensor_metadata_probe(
+                        "meta_probe_deepseek_pre_prepare_mlp_residual",
+                        residual,
+                        logger,
+                        peer=hidden_states,
+                        extra={
+                            "layer_id": self.layer_id,
+                            "forward_mode": int(forward_batch.forward_mode),
+                            "is_layer_sparse": bool(self.is_layer_sparse),
+                        },
+                    )
                     maybe_log_tail_row_probe(
                         "tail_probe_deepseek_pre_prepare_mlp_residual",
                         residual,
