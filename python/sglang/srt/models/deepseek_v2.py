@@ -247,6 +247,9 @@ _NAN_DIAG_SYNC_AFTER_SELF_ATTN = get_bool_env_var(
 _NAN_DIAG_SYNC_BEFORE_PREPARE_MLP = get_bool_env_var(
     "SGLANG_NAN_DIAG_SYNC_BEFORE_PREPARE_MLP", "false"
 )
+_NAN_DIAG_POST_SELF_ATTN_CLONE = get_bool_env_var(
+    "SGLANG_NAN_DIAG_POST_SELF_ATTN_CLONE", "false"
+)
 _NAN_DIAG_DEEPSEEK_META_LOG_ONCE = get_bool_env_var(
     "SGLANG_NAN_DIAG_DEEPSEEK_META_LOG_ONCE", "true"
 )
@@ -299,6 +302,24 @@ def _maybe_nan_diag_cuda_sync(enabled: bool) -> None:
     except Exception:
         return
     torch.cuda.synchronize()
+
+
+def _tensor_layout_extra_for_nan_diag(
+    tensor: Optional[torch.Tensor],
+) -> Dict[str, object]:
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return {}
+    extra: Dict[str, object] = {
+        "tensor_data_ptr": int(tensor.data_ptr()),
+        "tensor_storage_offset": int(tensor.storage_offset()),
+        "tensor_stride": tuple(int(x) for x in tensor.stride()),
+        "tensor_is_contiguous": bool(tensor.is_contiguous()),
+    }
+    try:
+        extra["tensor_storage_data_ptr"] = int(tensor.untyped_storage().data_ptr())
+    except Exception:
+        pass
+    return extra
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -1442,6 +1463,23 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             "attn_dp_size": get_attention_dp_size(),
         }
 
+    def _build_attn_diag_extra_with_layout(
+        self, forward_batch: ForwardBatch, tensor: Optional[torch.Tensor]
+    ) -> Dict[str, object]:
+        extra = self._build_attn_diag_extra(forward_batch)
+        extra.update(_tensor_layout_extra_for_nan_diag(tensor))
+        return extra
+
+    def _log_mla_return_output(
+        self, output: Optional[torch.Tensor], forward_batch: ForwardBatch
+    ) -> None:
+        maybe_log_tensor_stats(
+            "deepseek_attn_mla_return_output",
+            output,
+            logger,
+            extra=self._build_attn_diag_extra_with_layout(forward_batch, output),
+        )
+
     @staticmethod
     def _first_non_finite_row(tensor: Optional[torch.Tensor]) -> Optional[int]:
         if tensor is None or not isinstance(tensor, torch.Tensor):
@@ -1968,11 +2006,17 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         elif attn_forward_method == AttnForwardMethod.MHA_ONE_SHOT:
             return self.forward_normal_one_shot_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
-            return self.forward_absorb_core(*inner_state)
+            output = self.forward_absorb_core(*inner_state)
+            self._log_mla_return_output(output, forward_batch)
+            return output
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
-            return self.forward_absorb_fused_mla_rope_core(*inner_state)
+            output = self.forward_absorb_fused_mla_rope_core(*inner_state)
+            self._log_mla_return_output(output, forward_batch)
+            return output
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
-            return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
+            output = self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
+            self._log_mla_return_output(output, forward_batch)
+            return output
         elif attn_forward_method == AttnForwardMethod.MHA_NPU:
             return forward_mha_core_npu(self, *inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
@@ -2522,7 +2566,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             "deepseek_attn_mla_post_o_proj",
             output,
             logger,
-            extra=attn_diag_extra,
+            extra=self._build_attn_diag_extra_with_layout(forward_batch, output),
         )
 
         return output
@@ -2819,7 +2863,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             "deepseek_attn_mla_post_o_proj",
             output,
             logger,
-            extra=attn_diag_extra,
+            extra=self._build_attn_diag_extra_with_layout(forward_batch, output),
         )
 
         return output
@@ -2905,7 +2949,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             "deepseek_attn_mla_post_o_proj",
             output,
             logger,
-            extra=attn_diag_extra,
+            extra=self._build_attn_diag_extra_with_layout(forward_batch, output),
         )
 
         return output
@@ -3150,17 +3194,22 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
         )
+        if _NAN_DIAG_POST_SELF_ATTN_CLONE and isinstance(hidden_states, torch.Tensor):
+            # Diagnose potential alias/lifetime overwrite between attn output and later stages.
+            hidden_states = hidden_states.clone()
         _maybe_nan_diag_cuda_sync(_NAN_DIAG_SYNC_AFTER_SELF_ATTN)
         if _should_log_deepseek_block_layer(self.layer_id):
+            post_self_attn_extra = {
+                "layer_id": self.layer_id,
+                "forward_mode": int(forward_batch.forward_mode),
+                "is_layer_sparse": bool(self.is_layer_sparse),
+            }
+            post_self_attn_extra.update(_tensor_layout_extra_for_nan_diag(hidden_states))
             post_self_attn_has_non_finite = maybe_log_tensor_stats(
                 "deepseek_layer_hidden_post_self_attn",
                 hidden_states,
                 logger,
-                extra={
-                    "layer_id": self.layer_id,
-                    "forward_mode": int(forward_batch.forward_mode),
-                    "is_layer_sparse": bool(self.is_layer_sparse),
-                },
+                extra=post_self_attn_extra,
             )
             if post_self_attn_has_non_finite:
                 self.self_attn._log_mla_metadata_on_anomaly(
