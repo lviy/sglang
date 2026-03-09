@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_attention_dp_rank,
     get_dp_local_info,
     get_attention_dp_size,
     get_attention_tp_rank,
@@ -156,6 +157,10 @@ def _build_comm_dp_diag_extra(
 
     return {
         "dp_padding_mode": str(getattr(forward_batch, "dp_padding_mode", None)),
+        "attn_tp_rank": get_attention_tp_rank(),
+        "attn_dp_rank": get_attention_dp_rank(),
+        "tp_rank": get_tensor_model_parallel_rank(),
+        "tp_size": get_tensor_model_parallel_world_size(),
         "local_start_pos": _diag_safe_scalar(local_start_pos),
         "local_num_tokens": _diag_safe_scalar(local_num_tokens),
         "global_rows": global_rows,

@@ -488,9 +488,12 @@ def _dp_diag_extra(
     attn_dp_size = get_attention_dp_size()
     rows_per_attn_dp_shard = None
     global_rows_mod_attn_dp_size = None
+    global_num_tokens_cpu = getattr(forward_batch, "global_num_tokens_cpu", None)
     if global_rows is not None and attn_dp_size > 0:
         rows_per_attn_dp_shard = global_rows // attn_dp_size
         global_rows_mod_attn_dp_size = global_rows % attn_dp_size
+    if global_num_tokens_cpu is not None:
+        global_num_tokens_cpu = [int(x) for x in global_num_tokens_cpu]
     return {
         "forward_mode": int(forward_batch.forward_mode),
         "dp_padding_mode": str(forward_batch.dp_padding_mode),
@@ -508,6 +511,7 @@ def _dp_diag_extra(
         "global_rows": global_rows,
         "rows_per_attn_dp_shard": rows_per_attn_dp_shard,
         "global_rows_mod_attn_dp_size": global_rows_mod_attn_dp_size,
+        "global_num_tokens_cpu": global_num_tokens_cpu,
     }
 
 

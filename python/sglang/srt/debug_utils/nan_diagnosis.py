@@ -130,6 +130,162 @@ def _safe_int(value: object) -> Optional[int]:
         return None
 
 
+def _safe_int_list(value: object) -> Optional[list[int]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.startswith("[") and stripped.endswith("]"):
+            stripped = stripped[1:-1]
+        items = [item.strip() for item in stripped.split(",") if item.strip()]
+        if not items:
+            return None
+        try:
+            return [int(item) for item in items]
+        except Exception:
+            return None
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 1:
+            return None
+        try:
+            return [int(item) for item in value.detach().cpu().tolist()]
+        except Exception:
+            return None
+    try:
+        return [int(item) for item in value]
+    except Exception:
+        return None
+
+
+def _get_tensor_row_count(stats: Dict[str, object]) -> Optional[int]:
+    shape = stats.get("shape")
+    if isinstance(shape, (list, tuple)) and len(shape) > 0:
+        return _safe_int(shape[0])
+    return None
+
+
+def _infer_shard_from_prefix_sum(
+    global_row: int, global_num_tokens: list[int]
+) -> tuple[Optional[int], Optional[int]]:
+    if global_row < 0:
+        return None, None
+    shard_start = 0
+    for shard_idx, shard_rows in enumerate(global_num_tokens):
+        if shard_rows < 0:
+            return None, None
+        shard_end = shard_start + shard_rows
+        if shard_start <= global_row < shard_end:
+            return shard_idx, global_row - shard_start
+        shard_start = shard_end
+    return None, None
+
+
+def _build_first_non_finite_location_info(
+    stats: Dict[str, object], info: Dict[str, object]
+) -> Dict[str, object]:
+    first_row = _safe_int(stats.get("first_non_finite_row"))
+    if first_row is None:
+        return {}
+
+    tensor_rows = _get_tensor_row_count(stats)
+    local_start = _safe_int(info.get("local_start_pos"))
+    local_tokens = _safe_int(info.get("local_num_tokens"))
+    local_tokens_rows = _safe_int(info.get("local_tokens_rows"))
+    global_rows = _safe_int(info.get("global_rows"))
+    attn_dp_rank = _safe_int(info.get("attn_dp_rank"))
+    attn_dp_size = _safe_int(info.get("attn_dp_size"))
+    rows_per_shard = _safe_int(info.get("rows_per_attn_dp_shard"))
+    global_num_tokens = _safe_int_list(info.get("global_num_tokens_cpu"))
+    total_global_rows = (
+        sum(global_num_tokens) if global_num_tokens is not None else None
+    )
+
+    extra: Dict[str, object] = {}
+    global_row = None
+    row_space = "unknown"
+
+    if global_rows is not None and tensor_rows == global_rows:
+        row_space = "global"
+        global_row = first_row
+    elif total_global_rows is not None and tensor_rows == total_global_rows:
+        row_space = "global"
+        global_row = first_row
+    elif local_tokens_rows is not None and tensor_rows == local_tokens_rows:
+        row_space = "local_current_shard"
+        extra["first_non_finite_row_in_local_tensor"] = first_row
+    elif (
+        local_tokens is not None
+        and tensor_rows == local_tokens
+        and (global_rows is None or tensor_rows != global_rows)
+    ):
+        row_space = "local_current_shard"
+        extra["first_non_finite_row_in_local_tensor"] = first_row
+
+    extra["first_non_finite_row_space"] = row_space
+
+    if row_space == "local_current_shard" and local_tokens is not None:
+        extra["first_non_finite_in_local_padding_tail"] = first_row >= local_tokens
+
+    if row_space == "local_current_shard":
+        if (
+            local_start is not None
+            and local_tokens is not None
+            and 0 <= first_row < local_tokens
+        ):
+            global_row = local_start + first_row
+        elif local_start is not None and local_tokens is None and first_row >= 0:
+            global_row = local_start + first_row
+
+    if global_row is not None:
+        extra["first_non_finite_global_row"] = global_row
+
+    if local_start is not None and local_tokens is not None and local_tokens >= 0:
+        local_end = local_start + local_tokens
+        extra["local_row_begin"] = local_start
+        extra["local_row_end_exclusive"] = local_end
+        if global_row is not None:
+            extra["first_non_finite_in_local_range"] = (
+                local_start <= global_row < local_end
+            )
+        elif row_space == "local_current_shard":
+            extra["first_non_finite_in_local_range"] = 0 <= first_row < local_tokens
+
+    if global_row is not None and global_num_tokens is not None:
+        est_shard, row_in_shard = _infer_shard_from_prefix_sum(
+            global_row, global_num_tokens
+        )
+        if est_shard is not None and row_in_shard is not None:
+            extra["first_non_finite_est_attn_dp_shard"] = est_shard
+            extra["first_non_finite_row_in_est_shard"] = row_in_shard
+            extra["first_non_finite_shard_estimator"] = (
+                "global_num_tokens_cpu_prefix_sum"
+            )
+            return extra
+
+    if row_space == "local_current_shard" and attn_dp_rank is not None:
+        extra["first_non_finite_est_attn_dp_shard"] = attn_dp_rank
+        extra["first_non_finite_row_in_est_shard"] = first_row
+        extra["first_non_finite_shard_estimator"] = "current_attn_dp_rank"
+        return extra
+
+    est_row = global_row if global_row is not None else first_row
+    if est_row is not None and rows_per_shard is not None and rows_per_shard > 0:
+        est_shard = est_row // rows_per_shard
+        if attn_dp_size is None or 0 <= est_shard < attn_dp_size:
+            extra["first_non_finite_est_attn_dp_shard"] = est_shard
+            extra["first_non_finite_row_in_est_shard"] = est_row % rows_per_shard
+            extra["first_non_finite_shard_estimator"] = "uniform_rows_per_shard"
+        else:
+            extra["first_non_finite_shard_estimator"] = (
+                "uniform_rows_per_shard_out_of_range"
+            )
+            extra["first_non_finite_est_attn_dp_shard_invalid"] = est_shard
+
+    return extra
+
+
 def maybe_log_event(
     stage: str,
     logger: logging.Logger,
@@ -357,25 +513,7 @@ def maybe_log_tensor_stats(
     if extra:
         info.update(extra)
     if has_non_finite and "first_non_finite_row" in stats:
-        first_row = _safe_int(stats.get("first_non_finite_row"))
-        local_start = _safe_int(info.get("local_start_pos"))
-        local_tokens = _safe_int(info.get("local_num_tokens"))
-        if (
-            first_row is not None
-            and local_start is not None
-            and local_tokens is not None
-            and local_tokens >= 0
-        ):
-            local_end = local_start + local_tokens
-            info["local_row_begin"] = local_start
-            info["local_row_end_exclusive"] = local_end
-            info["first_non_finite_in_local_range"] = (
-                local_start <= first_row < local_end
-            )
-        rows_per_shard = _safe_int(info.get("rows_per_attn_dp_shard"))
-        if first_row is not None and rows_per_shard is not None and rows_per_shard > 0:
-            info["first_non_finite_est_attn_dp_shard"] = first_row // rows_per_shard
-            info["first_non_finite_row_in_est_shard"] = first_row % rows_per_shard
+        info.update(_build_first_non_finite_location_info(stats, info))
 
     if has_non_finite:
         logger.warning("NaNDiag anomaly: %s", info)
