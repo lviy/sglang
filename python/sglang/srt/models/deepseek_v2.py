@@ -81,6 +81,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_dp_local_info,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -319,6 +320,105 @@ def _nan_diag_tensor_identity(tensor: Optional[torch.Tensor]) -> Dict[str, objec
     except Exception:
         pass
     return info
+
+
+def _nan_diag_dp_rowspace_extra(
+    forward_batch: ForwardBatch,
+    *,
+    tensor_rows: Optional[int] = None,
+) -> Dict[str, object]:
+    extra: Dict[str, object] = {}
+    if torch.cuda.is_available():
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                extra["dp_rowspace_skipped_stream_capturing"] = True
+                return extra
+        except Exception:
+            return extra
+    if not is_dp_attention_enabled():
+        return extra
+
+    try:
+        attn_dp_size = get_attention_dp_size()
+    except Exception:
+        attn_dp_size = None
+    if attn_dp_size is None or attn_dp_size <= 1:
+        return extra
+
+    local_start_pos = None
+    local_num_tokens = None
+    try:
+        local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    except Exception:
+        pass
+
+    global_num_tokens_cpu = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if global_num_tokens_cpu is not None:
+        try:
+            global_num_tokens_cpu = [int(x) for x in global_num_tokens_cpu]
+        except Exception:
+            global_num_tokens_cpu = None
+
+    global_rows = getattr(forward_batch, "global_dp_buffer_len", None)
+    if global_rows is not None:
+        try:
+            global_rows = int(global_rows)
+        except Exception:
+            global_rows = None
+
+    extra.update(
+        {
+            "local_start_pos": int(local_start_pos.item())
+            if isinstance(local_start_pos, torch.Tensor) and local_start_pos.numel() == 1
+            else None,
+            "local_num_tokens": int(local_num_tokens.item())
+            if isinstance(local_num_tokens, torch.Tensor) and local_num_tokens.numel() == 1
+            else None,
+            "local_tokens_rows": tensor_rows,
+            "global_rows": global_rows,
+            "global_num_tokens_cpu": global_num_tokens_cpu,
+        }
+    )
+    return extra
+
+
+def _nan_diag_probe_snapshot(tensor: Optional[torch.Tensor]) -> Dict[str, object]:
+    snapshot: Dict[str, object] = {
+        "probe_has_non_finite": False,
+        "probe_non_finite_count": 0,
+        "probe_non_finite_row_count": 0,
+        "probe_first_non_finite_row": None,
+    }
+    if not isinstance(tensor, torch.Tensor):
+        return snapshot
+    if tensor.is_cuda:
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                snapshot["probe_snapshot_skipped_stream_capturing"] = True
+                return snapshot
+        except Exception:
+            snapshot["probe_snapshot_skipped_stream_capturing"] = True
+            return snapshot
+
+    data = tensor.detach()
+    snapshot["probe_tensor_shape"] = tuple(int(x) for x in data.shape)
+    non_finite_mask = ~torch.isfinite(data)
+    if not bool(non_finite_mask.any().item()):
+        return snapshot
+
+    snapshot["probe_has_non_finite"] = True
+    snapshot["probe_non_finite_count"] = int(non_finite_mask.sum().item())
+    if data.ndim >= 2:
+        row_mask = non_finite_mask.reshape(data.shape[0], -1).any(dim=1)
+        snapshot["probe_non_finite_row_count"] = int(row_mask.sum().item())
+        if snapshot["probe_non_finite_row_count"] > 0:
+            snapshot["probe_first_non_finite_row"] = int(row_mask.nonzero()[0].item())
+    else:
+        snapshot["probe_non_finite_row_count"] = 1
+        snapshot["probe_first_non_finite_row"] = int(
+            non_finite_mask.reshape(-1).nonzero()[0].item()
+        )
+    return snapshot
 
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
@@ -2539,6 +2639,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         )
         output, _ = self.o_proj(attn_bmm_output)
         o_proj_diag_extra = dict(attn_diag_extra)
+        o_proj_diag_extra.update(
+            _nan_diag_dp_rowspace_extra(
+                forward_batch,
+                tensor_rows=int(output.shape[0]) if output.ndim > 0 else None,
+            )
+        )
         o_proj_diag_extra.update(_nan_diag_tensor_identity(output))
         maybe_log_tensor_stats(
             "deepseek_attn_mla_post_o_proj",
@@ -2838,6 +2944,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         )
         output, _ = self.o_proj(attn_output)
         o_proj_diag_extra = dict(attn_diag_extra)
+        o_proj_diag_extra.update(
+            _nan_diag_dp_rowspace_extra(
+                forward_batch,
+                tensor_rows=int(output.shape[0]) if output.ndim > 0 else None,
+            )
+        )
         o_proj_diag_extra.update(_nan_diag_tensor_identity(output))
         maybe_log_tensor_stats(
             "deepseek_attn_mla_post_o_proj",
@@ -2926,6 +3038,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         )
         output, _ = self.o_proj(attn_output)
         o_proj_diag_extra = dict(attn_diag_extra)
+        o_proj_diag_extra.update(
+            _nan_diag_dp_rowspace_extra(
+                forward_batch,
+                tensor_rows=int(output.shape[0]) if output.ndim > 0 else None,
+            )
+        )
         o_proj_diag_extra.update(_nan_diag_tensor_identity(output))
         maybe_log_tensor_stats(
             "deepseek_attn_mla_post_o_proj",
@@ -3111,6 +3229,116 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return trace
 
+    def _build_boundary_focus_context(
+        self,
+        *,
+        row_count: int,
+        first_non_finite_row: Optional[int],
+        q_total_rows: Optional[int],
+        qo_indptr_cpu: Optional[torch.Tensor],
+        req_pool_indices_cpu: Optional[torch.Tensor],
+        out_cache_loc_rows: Optional[int],
+        out_cache_loc_cpu: Optional[torch.Tensor],
+        out_cache_zero_tail_begin: Optional[int],
+        positions: Optional[torch.Tensor],
+    ) -> Dict[str, object]:
+        if first_non_finite_row is None:
+            return {}
+
+        context: Dict[str, object] = {
+            "first_non_finite_row": first_non_finite_row,
+            "first_non_finite_matches_hidden_tail": first_non_finite_row == row_count - 1,
+            "first_non_finite_distance_to_hidden_tail": row_count - 1 - first_non_finite_row,
+        }
+
+        boundary_context_reasons = ["first_non_finite_row_present"]
+        if context["first_non_finite_matches_hidden_tail"]:
+            boundary_context_reasons.append("matches_hidden_tail")
+
+        if q_total_rows is not None:
+            context["first_non_finite_matches_qo_indptr_tail"] = (
+                first_non_finite_row == q_total_rows - 1
+            )
+            context["first_non_finite_distance_to_qo_indptr_tail"] = (
+                q_total_rows - 1 - first_non_finite_row
+            )
+            context["first_non_finite_beyond_qo_indptr"] = first_non_finite_row >= q_total_rows
+            if context["first_non_finite_matches_qo_indptr_tail"]:
+                boundary_context_reasons.append("matches_qo_indptr_tail")
+            if context["first_non_finite_beyond_qo_indptr"]:
+                boundary_context_reasons.append("beyond_qo_indptr")
+
+        if out_cache_loc_rows is not None:
+            context["first_non_finite_matches_out_cache_loc_tail"] = (
+                first_non_finite_row == out_cache_loc_rows - 1
+            )
+            context["first_non_finite_distance_to_out_cache_loc_tail"] = (
+                out_cache_loc_rows - 1 - first_non_finite_row
+            )
+            context["first_non_finite_beyond_out_cache_loc"] = (
+                first_non_finite_row >= out_cache_loc_rows
+            )
+            if context["first_non_finite_matches_out_cache_loc_tail"]:
+                boundary_context_reasons.append("matches_out_cache_loc_tail")
+            if context["first_non_finite_beyond_out_cache_loc"]:
+                boundary_context_reasons.append("beyond_out_cache_loc")
+
+        if (
+            out_cache_zero_tail_begin is not None
+            and first_non_finite_row >= out_cache_zero_tail_begin
+        ):
+            context["first_non_finite_in_zero_out_cache_tail"] = True
+            boundary_context_reasons.append("inside_zero_out_cache_tail")
+        else:
+            context["first_non_finite_in_zero_out_cache_tail"] = False
+
+        first_trace = self._build_boundary_row_trace(
+            row_idx=first_non_finite_row,
+            reasons=["first_non_finite_row"],
+            qo_indptr_cpu=qo_indptr_cpu,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            out_cache_loc_cpu=out_cache_loc_cpu,
+            positions=positions,
+        )
+        context["first_non_finite_row_trace"] = first_trace
+        if first_trace.get("out_cache_loc_value") == 0:
+            context["first_non_finite_out_cache_loc_zero"] = True
+            boundary_context_reasons.append("out_cache_loc_zero")
+        else:
+            context["first_non_finite_out_cache_loc_zero"] = False
+
+        sample_count = min(_NAN_DIAG_BOUNDARY_ROW_CHECK_MAX_ROWS, row_count)
+        row_begin = max(
+            0,
+            min(first_non_finite_row, row_count - sample_count),
+        )
+        row_end = min(row_count, row_begin + sample_count)
+        focus_rows = []
+        for row_idx in range(row_begin, row_end):
+            row_reasons = []
+            if row_idx == first_non_finite_row:
+                row_reasons.append("first_non_finite_row")
+            if q_total_rows is not None and row_idx >= q_total_rows:
+                row_reasons.append("tail_beyond_qo_indptr")
+            if out_cache_loc_rows is not None and row_idx >= out_cache_loc_rows:
+                row_reasons.append("tail_beyond_out_cache_loc")
+            if out_cache_zero_tail_begin is not None and row_idx >= out_cache_zero_tail_begin:
+                row_reasons.append("tail_zero_out_cache_loc")
+            focus_rows.append(
+                self._build_boundary_row_trace(
+                    row_idx=row_idx,
+                    reasons=row_reasons,
+                    qo_indptr_cpu=qo_indptr_cpu,
+                    req_pool_indices_cpu=req_pool_indices_cpu,
+                    out_cache_loc_cpu=out_cache_loc_cpu,
+                    positions=positions,
+                )
+            )
+
+        context["boundary_context_reasons"] = boundary_context_reasons
+        context["boundary_focus_row_sample"] = focus_rows
+        return context
+
     def _nan_diag_check_prepare_mlp_boundary(
         self,
         *,
@@ -3142,6 +3370,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         if isinstance(qo_indptr, torch.Tensor) and qo_indptr.numel() > 0:
             q_total_rows = int(qo_indptr[-1].item())
             qo_indptr_cpu = qo_indptr.detach().to("cpu")
+
+        req_pool_indices_cpu = None
+        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
+            req_pool_indices_cpu = forward_batch.req_pool_indices.detach().to("cpu")
 
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         out_cache_loc_rows = None
@@ -3176,6 +3408,37 @@ class DeepseekV2DecoderLayer(nn.Module):
                             if row < out_cache_zero_tail_begin
                         ][:_NAN_DIAG_BOUNDARY_ROW_CHECK_MAX_ROWS]
 
+        first_non_finite_row = self.self_attn._first_non_finite_row(hidden_states)
+        boundary_focus_context = self._build_boundary_focus_context(
+            row_count=row_count,
+            first_non_finite_row=first_non_finite_row,
+            q_total_rows=q_total_rows,
+            qo_indptr_cpu=qo_indptr_cpu,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            out_cache_loc_rows=out_cache_loc_rows,
+            out_cache_loc_cpu=out_cache_loc_cpu,
+            out_cache_zero_tail_begin=out_cache_zero_tail_begin,
+            positions=positions,
+        )
+        if boundary_focus_context and _should_emit_deepseek_meta(
+            "boundary_context", self.layer_id
+        ):
+            maybe_log_event(
+                "deepseek_layer_hidden_pre_prepare_mlp_boundary_context",
+                logger,
+                extra={
+                    "layer_id": self.layer_id,
+                    "forward_mode": int(forward_batch.forward_mode),
+                    "row_count": row_count,
+                    "q_total_rows_from_qo_indptr": q_total_rows,
+                    "out_cache_loc_rows": out_cache_loc_rows,
+                    "out_cache_zero_tail_begin": out_cache_zero_tail_begin,
+                    "out_cache_zero_non_tail_indices": out_cache_zero_non_tail_indices,
+                    **boundary_focus_context,
+                },
+                force=True,
+            )
+
         mismatch_reasons: list[str] = []
         invalid_tail_candidates: list[tuple[int, str]] = []
         if q_total_rows is not None and q_total_rows != row_count:
@@ -3198,10 +3461,6 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if not mismatch_reasons:
             return
-
-        req_pool_indices_cpu = None
-        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
-            req_pool_indices_cpu = forward_batch.req_pool_indices.detach().to("cpu")
 
         invalid_tail_row_begin = None
         invalid_tail_reasons: list[str] = []
@@ -3394,9 +3653,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             "layer_id": self.layer_id,
             "forward_mode": int(forward_batch.forward_mode),
             "is_layer_sparse": bool(self.is_layer_sparse),
+            **_nan_diag_dp_rowspace_extra(
+                forward_batch,
+                tensor_rows=(
+                    int(hidden_states.shape[0]) if hidden_states.ndim > 0 else None
+                ),
+            ),
             **_nan_diag_tensor_identity(hidden_states),
         }
         if _NAN_DIAG_SELF_ATTN_OUTPUT_RACE_PROBE:
+            pre_sync_snapshot = _nan_diag_probe_snapshot(hidden_states)
             pre_sync_has_non_finite = maybe_log_tensor_stats(
                 "deepseek_layer_hidden_post_self_attn_probe_pre_sync",
                 hidden_states,
@@ -3410,12 +3676,74 @@ class DeepseekV2DecoderLayer(nn.Module):
                     logger,
                     extra=post_self_attn_diag_extra,
                 )
+                post_sync_snapshot = _nan_diag_probe_snapshot(hidden_states)
                 post_sync_has_non_finite = maybe_log_tensor_stats(
                     "deepseek_layer_hidden_post_self_attn_probe_post_sync",
                     hidden_states,
                     logger,
                     extra=post_self_attn_diag_extra,
                 )
+                probe_transition = None
+                if (not pre_sync_snapshot["probe_has_non_finite"]) and post_sync_snapshot[
+                    "probe_has_non_finite"
+                ]:
+                    probe_transition = "finite_to_non_finite_after_sync"
+                elif pre_sync_snapshot["probe_has_non_finite"] and (
+                    not post_sync_snapshot["probe_has_non_finite"]
+                ):
+                    probe_transition = "non_finite_to_finite_after_sync"
+                elif pre_sync_snapshot["probe_has_non_finite"] and post_sync_snapshot[
+                    "probe_has_non_finite"
+                ]:
+                    if (
+                        pre_sync_snapshot.get("probe_first_non_finite_row")
+                        != post_sync_snapshot.get("probe_first_non_finite_row")
+                        or pre_sync_snapshot.get("probe_non_finite_count")
+                        != post_sync_snapshot.get("probe_non_finite_count")
+                    ):
+                        probe_transition = "non_finite_changed_across_sync"
+                    else:
+                        probe_transition = "non_finite_persisted_across_sync"
+
+                if (
+                    probe_transition is not None
+                    and _should_emit_deepseek_meta(
+                        f"probe_{probe_transition}", self.layer_id
+                    )
+                ):
+                    maybe_log_event(
+                        "deepseek_layer_hidden_post_self_attn_probe_transition",
+                        logger,
+                        extra={
+                            **post_self_attn_diag_extra,
+                            "probe_transition": probe_transition,
+                            "pre_sync_has_non_finite": bool(
+                                pre_sync_snapshot["probe_has_non_finite"]
+                            ),
+                            "pre_sync_non_finite_count": pre_sync_snapshot.get(
+                                "probe_non_finite_count"
+                            ),
+                            "pre_sync_first_non_finite_row": pre_sync_snapshot.get(
+                                "probe_first_non_finite_row"
+                            ),
+                            "pre_sync_non_finite_row_count": pre_sync_snapshot.get(
+                                "probe_non_finite_row_count"
+                            ),
+                            "post_sync_has_non_finite": bool(
+                                post_sync_snapshot["probe_has_non_finite"]
+                            ),
+                            "post_sync_non_finite_count": post_sync_snapshot.get(
+                                "probe_non_finite_count"
+                            ),
+                            "post_sync_first_non_finite_row": post_sync_snapshot.get(
+                                "probe_first_non_finite_row"
+                            ),
+                            "post_sync_non_finite_row_count": post_sync_snapshot.get(
+                                "probe_non_finite_row_count"
+                            ),
+                        },
+                        force=True,
+                    )
                 if (not pre_sync_has_non_finite) and post_sync_has_non_finite:
                     maybe_log_event(
                         "deepseek_layer_hidden_post_self_attn_probe_race_suspect",
@@ -3423,6 +3751,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                         extra={
                             **post_self_attn_diag_extra,
                             "probe_transition": "finite_to_non_finite_after_sync",
+                            "pre_sync_has_non_finite": False,
+                            "post_sync_has_non_finite": True,
+                            "post_sync_first_non_finite_row": post_sync_snapshot.get(
+                                "probe_first_non_finite_row"
+                            ),
+                            "post_sync_non_finite_count": post_sync_snapshot.get(
+                                "probe_non_finite_count"
+                            ),
                         },
                         force=True,
                     )
