@@ -301,9 +301,14 @@ if is_blackwell_supported() and is_flashinfer_available():
         )
 
 
+fp8_blockscale_gemm_sm90 = None
 if is_sm90_supported() and is_flashinfer_available():
-    # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
-    from flashinfer.gemm import fp8_blockscale_gemm_sm90
+    # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M.
+    # Some flashinfer builds do not expose this symbol; keep import optional.
+    try:
+        from flashinfer.gemm import fp8_blockscale_gemm_sm90
+    except ImportError:
+        fp8_blockscale_gemm_sm90 = None
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
@@ -357,11 +362,15 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_flashinfer_deepgemm():
-        if not (is_sm90_supported() and is_flashinfer_available()):
+        if not (
+            is_sm90_supported()
+            and is_flashinfer_available()
+            and fp8_blockscale_gemm_sm90 is not None
+        ):
             raise RuntimeError(
                 "FlashInfer DeepGEMM with swapAB requested via --fp8-gemm-backend=flashinfer_deepgemm, "
                 "but it's not available. This backend requires Hopper (SM90) GPUs and FlashInfer "
-                "to be installed."
+                "with fp8_blockscale_gemm_sm90 support."
             )
         return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
 
@@ -549,6 +558,11 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
     For SM90 (Hopper), this uses the DeepGEMM JIT with automatic swapAB selection.
     """
     assert input_scale is None
+
+    if fp8_blockscale_gemm_sm90 is None:
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
 
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
