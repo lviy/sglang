@@ -670,25 +670,14 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
-                if self._is_mxint4a16(weight_quant, input_quant):
-                    if (
-                        get_moe_runner_backend().is_flashinfer_trtllm()
-                        and CompressedTensorsMxInt4MoE.is_kernel_available()
-                    ):
-                        logger.info_once(
-                            "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
-                        )
-                        return CompressedTensorsMxInt4MoE(self)
-                    if get_moe_runner_backend().is_flashinfer_trtllm():
-                        logger.warning_once(
-                            "flashinfer kernel trtllm_mxint4_block_scale_moe is unavailable; "
-                            "disable mxint4 TRTLLM MoE path and fall back to WNA16 MoE."
-                        )
-                    if _is_hip:
-                        logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
-                        return CompressedTensorsWNA16TritonMoE(self)
-                    logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
-                    return CompressedTensorsWNA16MoE(self)
+                if (
+                    self._is_mxint4a16(weight_quant, input_quant)
+                    and get_moe_runner_backend().is_flashinfer_trtllm()
+                ):
+                    logger.info_once(
+                        "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
+                    )
+                    return CompressedTensorsMxInt4MoE(self)
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(self)

@@ -761,21 +761,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
-        def _filter_optional_tensor(tensor: Optional[torch.Tensor]):
-            if tensor is None:
-                return None
-            if has_been_filtered:
-                return tensor[: len(new_indices)]
-            return tensor[new_indices]
-
-        def _filter_optional_list(items: Optional[List[int]]):
-            if items is None:
-                return None
-            if has_been_filtered:
-                return items[: len(new_indices)]
-            indices = new_indices.tolist()
-            return [items[i] for i in indices]
-
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
@@ -787,28 +772,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 else:
                     logger.warning(error_msg)
 
-        self.topk_p = _filter_optional_tensor(self.topk_p)
-        self.topk_index = _filter_optional_tensor(self.topk_index)
-        self.hidden_states = _filter_optional_tensor(self.hidden_states)
-        self.verified_id = _filter_optional_tensor(self.verified_id)
-        self.accept_length = _filter_optional_tensor(self.accept_length)
-        self.accept_length_cpu = _filter_optional_list(self.accept_length_cpu)
-        self.seq_lens_for_draft_extend = _filter_optional_tensor(
-            self.seq_lens_for_draft_extend
-        )
-        self.req_pool_indices_for_draft_extend = _filter_optional_tensor(
-            self.req_pool_indices_for_draft_extend
-        )
-
-        if self.seq_lens_for_draft_extend_cpu is not None:
-            if has_been_filtered:
-                self.seq_lens_for_draft_extend_cpu = self.seq_lens_for_draft_extend_cpu[
-                    : len(new_indices)
-                ]
-            else:
-                self.seq_lens_for_draft_extend_cpu = self.seq_lens_for_draft_extend_cpu[
-                    new_indices.cpu()
-                ]
+            self.topk_p = self.topk_p[: len(new_indices)]
+            self.topk_index = self.topk_index[: len(new_indices)]
+            self.hidden_states = self.hidden_states[: len(new_indices)]
+            self.verified_id = self.verified_id[: len(new_indices)]
+        else:
+            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
+            self.topk_p = self.topk_p[new_indices]
+            self.topk_index = self.topk_index[new_indices]
+            self.hidden_states = self.hidden_states[new_indices]
+            self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:

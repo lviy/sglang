@@ -33,36 +33,18 @@ if TYPE_CHECKING:
     )
 
 if is_flashinfer_available():
-    try:
-        from flashinfer.fp4_quantization import block_scale_interleave
-        from flashinfer.fused_moe import (
-            convert_to_block_layout,
-            trtllm_mxint4_block_scale_moe,
-        )
-        from flashinfer.fused_moe.core import (
-            _maybe_get_cached_w3_w1_permute_indices,
-            get_w2_permute_indices_with_cache,
-        )
-    except ImportError:
-        # Some flashinfer builds do not ship trtllm_mxint4_block_scale_moe.
-        block_scale_interleave = None
-        convert_to_block_layout = None
-        trtllm_mxint4_block_scale_moe = None
-        _maybe_get_cached_w3_w1_permute_indices = None
-        get_w2_permute_indices_with_cache = None
-else:
-    block_scale_interleave = None
-    convert_to_block_layout = None
-    trtllm_mxint4_block_scale_moe = None
-    _maybe_get_cached_w3_w1_permute_indices = None
-    get_w2_permute_indices_with_cache = None
+    from flashinfer.fp4_quantization import block_scale_interleave
+    from flashinfer.fused_moe import (
+        convert_to_block_layout,
+        trtllm_mxint4_block_scale_moe,
+    )
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
 
 
 class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
-    @staticmethod
-    def is_kernel_available() -> bool:
-        return trtllm_mxint4_block_scale_moe is not None
-
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
         config = self.quant_config.target_scheme_map["Linear"].get("weights")
@@ -80,11 +62,6 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         assert (
             get_moe_runner_backend().is_flashinfer_trtllm()
         ), "MxInt4 only supports flashinfer_trtllm backend"
-        if not self.is_kernel_available():
-            raise RuntimeError(
-                "flashinfer does not provide trtllm_mxint4_block_scale_moe in the "
-                "current environment. This mxint4 TRTLLM MoE path is disabled."
-            )
         assert (
             not config.actorder
         ), "Actorder is not supported by flashinfer_trtllm backend"
