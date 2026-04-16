@@ -993,7 +993,13 @@ class FlashAttentionBackend(AttentionBackend):
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_global_server_args().disable_chunked_prefix_cache
+                    # Prefer the layer-local flag captured during model init. In
+                    # speculative decoding, draft and target runners can share and
+                    # mutate the process-global server args, so the global flag may
+                    # no longer match the dispatch decision that selected this path.
+                    assert not getattr(
+                        layer, "disable_chunked_prefix_cache", False
+                    )
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None

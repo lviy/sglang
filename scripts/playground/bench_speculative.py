@@ -35,6 +35,11 @@ def node0_print(msg):
         print(msg)
 
 
+def maybe_extend_arg(other_args, flag, value):
+    if value is not None:
+        other_args.extend([flag, value])
+
+
 prompts = [
     "Human: Give me a fully functional FastAPI server. Show the full, long python code without stop.\n\nAssistant:",
     "Human: Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.\n\nAssistant:",
@@ -194,6 +199,20 @@ def main(args, server_args):
                 batch_size,
             ]
         )
+
+        maybe_extend_arg(other_args, "--dp-size", server_args.dp_size)
+        maybe_extend_arg(
+            other_args, "--load-balance-method", server_args.load_balance_method
+        )
+        maybe_extend_arg(other_args, "--dist-init-addr", server_args.dist_init_addr)
+        maybe_extend_arg(other_args, "--max-queued-requests", server_args.max_queued_requests)
+        maybe_extend_arg(other_args, "--attn-cp-size", server_args.attn_cp_size)
+        maybe_extend_arg(other_args, "--moe-dp-size", server_args.moe_dp_size)
+
+        if server_args.enable_dp_attention:
+            other_args.extend(["--enable-dp-attention"])
+        if server_args.enable_dp_lm_head:
+            other_args.extend(["--enable-dp-lm-head"])
 
         if server_args.trust_remote_code:
             other_args.extend(
