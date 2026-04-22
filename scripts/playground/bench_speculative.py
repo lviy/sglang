@@ -195,6 +195,20 @@ def main(args, server_args):
             ]
         )
 
+        if server_args.dp_size != 1:
+            other_args.extend(
+                [
+                    "--dp-size",
+                    server_args.dp_size,
+                ]
+            )
+
+        if server_args.enable_dp_attention:
+            other_args.extend(["--enable-dp-attention"])
+
+        if server_args.enable_dp_lm_head:
+            other_args.extend(["--enable-dp-lm-head"])
+
         if server_args.trust_remote_code:
             other_args.extend(
                 [
