@@ -35,6 +35,67 @@ def node0_print(msg):
         print(msg)
 
 
+def get_step_time_values(server_info, batch_size):
+    internal_states = server_info.get("internal_states", [])
+    enable_dp_attention = server_info.get("enable_dp_attention", False)
+    dp_size = max(server_info.get("dp_size", 1), 1)
+
+    if enable_dp_attention:
+        candidate_batch_sizes = sorted(
+            {
+                max(batch_size // dp_size, 1),
+                max((batch_size + dp_size - 1) // dp_size, 1),
+            }
+        )
+    else:
+        candidate_batch_sizes = [batch_size]
+
+    matched_values = []
+    for local_bs in candidate_batch_sizes:
+        key = str(local_bs)
+        for state in internal_states:
+            values = state.get("step_time_dict", {}).get(key)
+            if values:
+                matched_values.extend(values)
+
+    if matched_values:
+        return matched_values
+
+    # Fall back to the nearest available local batch-size key if the exact
+    # per-DP key was not recorded.
+    all_keys = set()
+    for state in internal_states:
+        for key in state.get("step_time_dict", {}):
+            try:
+                all_keys.add(int(key))
+            except (TypeError, ValueError):
+                continue
+
+    if not all_keys:
+        raise KeyError(
+            f"No step_time_dict entries found for batch_size={batch_size} "
+            f"(candidate keys: {candidate_batch_sizes})."
+        )
+
+    target_bs = candidate_batch_sizes[-1]
+    nearest_key = min(all_keys, key=lambda key: abs(key - target_bs))
+    for state in internal_states:
+        values = state.get("step_time_dict", {}).get(str(nearest_key))
+        if values:
+            matched_values.extend(values)
+
+    if not matched_values:
+        raise KeyError(
+            f"Cannot find a usable step_time_dict entry for batch_size={batch_size}. "
+            f"Nearest available key: {nearest_key}."
+        )
+
+    node0_print(
+        f"Fallback to step_time_dict[{nearest_key}] for batch_size={batch_size}."
+    )
+    return matched_values
+
+
 prompts = [
     "Human: Give me a fully functional FastAPI server. Show the full, long python code without stop.\n\nAssistant:",
     "Human: Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.\n\nAssistant:",
@@ -121,9 +182,7 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
 
     server_info = requests.get(base_url + "/server_info").json()
     # We use 20% percentile instead of median on purpose
-    step_time = np.percentile(
-        server_info["internal_states"][0]["step_time_dict"][str(batch_size)], 20
-    )
+    step_time = np.percentile(get_step_time_values(server_info, batch_size), 20)
     speed = 1 / step_time * acc_length
 
     return (
