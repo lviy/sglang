@@ -69,7 +69,7 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
             :num_prompts
         ]
         input_requests: List[DatasetRow] = [
-            DatasetRow(p, 0, 512) for p in padded_prompts
+            DatasetRow(p, 0, 8192) for p in padded_prompts
         ]
         backend = "sglang"
         api_url = f"{base_url}/generate"
@@ -171,14 +171,14 @@ def main(args, server_args):
                 topk,
                 "--speculative-num-draft-tokens",
                 num_draft_tokens,
+                "--speculative-algorithm",
+                server_args.speculative_algorithm,
             ]
             if server_args.speculative_draft_model_path is not None:
                 other_args.extend(
                     [
                         "--speculative-draft-model-path",
                         server_args.speculative_draft_model_path,
-                        "--speculative-algorithm",
-                        server_args.speculative_algorithm,
                     ]
                 )
 
